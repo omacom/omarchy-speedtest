@@ -12,6 +12,8 @@ import (
 	"net/http/httptrace"
 	"slices"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -46,6 +48,9 @@ type config struct {
 	warmup      time.Duration // connecting and warming every connection
 	window      time.Duration // measured transfer time
 	drain       time.Duration // extra time for the last uploads to be confirmed
+	// Count uploads only by confirmed requests, even where the kernel can
+	// say what was acknowledged. Tests use it to exercise that path.
+	confirmedOnly bool
 }
 
 func defaultConfig() config {
@@ -124,23 +129,50 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		}
 	}
 
-	total := func() (n int64) {
+	confirmed := func() (n int64) {
 		for _, w := range workers {
 			n += w.bytes.Load()
 		}
 		return n
 	}
+	// Uploads count what the server's TCP acknowledged during the window,
+	// where the kernel says, so a slow last answer cannot stretch the clock.
+	var socket *socketCount
+	if dir == upload && !cfg.confirmedOnly {
+		socket = newSocketCount(workers, strings.HasPrefix(cfg.url, "https://"))
+	}
+	total := func() int64 {
+		if n, ok := socket.delivered(); ok {
+			return n
+		}
+		return confirmed()
+	}
 
 	started = time.Now()
+	socket.start()
 	close(gate)
 
 	limit := time.NewTimer(cfg.window + cfg.drain + time.Second)
 	defer limit.Stop()
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
+	windowEnd := time.NewTimer(cfg.window)
+	defer windowEnd.Stop()
 	ended := started
 	for finished := 0; finished < cfg.connections; {
 		select {
+		case <-windowEnd.C:
+			if n, ok := socket.delivered(); ok {
+				if n == 0 {
+					return result{}, errors.New("the connection is too slow to finish an upload in the test window")
+				}
+				return result{
+					Bytes:       n,
+					Seconds:     cfg.window.Seconds(),
+					Mbps:        mbps(n, cfg.window),
+					Connections: cfg.connections,
+				}, nil
+			}
 		case e := <-done:
 			if e.err != nil {
 				return result{}, e.err
@@ -158,7 +190,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		}
 	}
 
-	bytes := total()
+	bytes := confirmed()
 	if bytes == 0 && dir == upload {
 		for _, w := range workers {
 			if w.acked > 0 {
@@ -210,6 +242,13 @@ type worker struct {
 	window      time.Duration
 	windowEnd   time.Time          // zero until the first measured byte
 	closeWindow context.CancelFunc // cuts the request in flight at windowEnd
+
+	// Upload accounting from the kernel: the current connection, and what
+	// connections closed since the window opened had acknowledged.
+	socketMu sync.Mutex
+	conn     *countedConn
+	counting bool
+	retired  uint64
 }
 
 // errWindowClosed ends a download whose window closed mid-request.
@@ -220,7 +259,6 @@ func newWorker(cfg config, dir mode) *worker {
 	protocols.SetHTTP1(true)
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
-		DialContext:         (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
 		TLSClientConfig:     cfg.tls,
 		TLSHandshakeTimeout: 3 * time.Second,
 		MaxConnsPerHost:     1,
@@ -244,6 +282,19 @@ func newWorker(cfg config, dir mode) *worker {
 	}
 	if dir == upload {
 		w.sizes = uploadSizes
+	}
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, address)
+		tcp, ok := conn.(*net.TCPConn)
+		if err != nil || !ok {
+			return conn, err
+		}
+		counted := &countedConn{TCPConn: tcp, w: w}
+		w.socketMu.Lock()
+		w.conn = counted
+		w.socketMu.Unlock()
+		return counted, nil
 	}
 	w.trace.GotConn = func(info httptrace.GotConnInfo) { w.reused.Store(info.Reused) }
 	return w
@@ -486,4 +537,86 @@ func (z *zeros) Read(p []byte) (int, error) {
 	clear(p[:n])
 	z.left -= int64(n)
 	return n, nil
+}
+
+// countedConn records, as it closes, what the server acknowledged on it,
+// so a connection replaced mid-window loses none of its count.
+type countedConn struct {
+	*net.TCPConn
+	w    *worker
+	base uint64 // acknowledged before the window opened
+	gone bool
+}
+
+func (c *countedConn) Close() error {
+	c.w.socketMu.Lock()
+	if c.w.counting && !c.gone {
+		if acked, ok := bytesAcked(c.TCPConn); ok {
+			c.w.retired += acked - c.base
+		}
+	}
+	c.gone = true
+	c.w.socketMu.Unlock()
+	return c.TCPConn.Close()
+}
+
+// socketCount reads how many bytes the server's TCP has acknowledged on
+// every worker's connections since the window opened.
+type socketCount struct {
+	workers []*worker
+	tls     bool
+	ok      bool
+}
+
+func newSocketCount(workers []*worker, tls bool) *socketCount {
+	return &socketCount{workers: workers, tls: tls}
+}
+
+func (s *socketCount) start() {
+	if s == nil {
+		return
+	}
+	s.ok = true
+	for _, w := range s.workers {
+		w.socketMu.Lock()
+		if w.conn == nil {
+			s.ok = false
+		} else if acked, ok := bytesAcked(w.conn.TCPConn); ok {
+			w.conn.base = acked
+		} else {
+			s.ok = false
+		}
+		w.counting, w.retired = true, 0
+		w.socketMu.Unlock()
+	}
+}
+
+// TLS 1.3 wraps each full 16 KiB record in 22 bytes of framing; the HTTP
+// request lines add about 200 bytes per upload, which is not removed.
+const tlsRecordPayload, tlsRecordOverhead = 16384, 22
+
+// delivered returns the payload acknowledged since start, or false where
+// the kernel cannot say.
+func (s *socketCount) delivered() (int64, bool) {
+	if s == nil || !s.ok {
+		return 0, false
+	}
+	var n uint64
+	for _, w := range s.workers {
+		w.socketMu.Lock()
+		n += w.retired
+		if c := w.conn; c != nil && !c.gone {
+			acked, ok := bytesAcked(c.TCPConn)
+			if !ok {
+				w.socketMu.Unlock()
+				return 0, false
+			}
+			n += acked - c.base
+		}
+		w.socketMu.Unlock()
+	}
+	if s.tls {
+		n = n * tlsRecordPayload / (tlsRecordPayload + tlsRecordOverhead)
+	}
+	return int64(n), true
 }
