@@ -350,6 +350,7 @@ func newWorker(cfg config, dir mode) *worker {
 		base:  cfg.url,
 		dir:   dir,
 		sizes: downloadSizes,
+		win:   newDownloadWindow(cfg.window), // run shares one across its workers
 		buf:   make([]byte, 64<<10),
 	}
 	if dir == upload {

@@ -48,6 +48,8 @@ jobs:
         run: go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out ./...
       - name: Coverage
         run: go tool cover -func=coverage.out | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Benchmarks run
+        run: go test -run='^$' -bench=. -benchtime=1x ./...
 
   lint:
     name: lint
