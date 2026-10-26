@@ -38,7 +38,10 @@ type service struct {
 	firstByteDelay time.Duration
 	// One bottleneck for every measured download, in bytes per second, and
 	// a first byte held back a second on every other connection.
-	sharedRate       float64
+	sharedRate float64
+	// One slow link under every request, warm-up included: body bytes in
+	// either direction, in bytes per second shared by all connections.
+	linkRate         float64
 	staggerFirstByte bool
 	// Answer measured uploads that arrive lateAfter or later into the
 	// measurement only after lateAnswer: the slow last answer that used to
@@ -65,6 +68,7 @@ type service struct {
 
 	closed   atomic.Bool
 	paceNext time.Time      // when the shared bottleneck is next free
+	linkNext time.Time      // when the slow link is next free
 	seen     map[string]int // measured download requests per connection
 	requests atomic.Int64
 	http2    atomic.Int64 // requests that did not use HTTP/1.1
@@ -158,6 +162,7 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		e.serve(w, limit, e.chunk, e.chunkDelay, func(n int64) {
+			e.link(n)
 			if measured {
 				e.pace(n)
 				e.mark(n)
@@ -207,6 +212,7 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if e.upRate > 0 {
 				time.Sleep(time.Duration(float64(n) / e.upRate * float64(time.Second)))
 			}
+			e.link(int64(n))
 			if err != nil {
 				break
 			}
@@ -258,17 +264,24 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // pace holds a write until the shared bottleneck has room for it.
-func (e *service) pace(n int64) {
-	if e.sharedRate == 0 {
+func (e *service) pace(n int64) { e.hold(e.sharedRate, &e.paceNext, n) }
+
+// link holds n bytes on the slow link, if there is one.
+func (e *service) link(n int64) { e.hold(e.linkRate, &e.linkNext, n) }
+
+// hold delays n bytes so the bytes it holds pass at rate bytes per second,
+// shared by every caller that holds on the same next.
+func (e *service) hold(rate float64, next *time.Time, n int64) {
+	if rate == 0 {
 		return
 	}
 	e.mu.Lock()
 	now := time.Now()
-	if e.paceNext.Before(now) {
-		e.paceNext = now
+	if next.Before(now) {
+		*next = now
 	}
-	at := e.paceNext
-	e.paceNext = e.paceNext.Add(time.Duration(float64(n) / e.sharedRate * float64(time.Second)))
+	at := *next
+	*next = next.Add(time.Duration(float64(n) / rate * float64(time.Second)))
 	e.mu.Unlock()
 	time.Sleep(time.Until(at))
 }
@@ -428,6 +441,22 @@ func TestVerySlowLinksStillMeasure(t *testing.T) {
 	_, srv := newService(t, &service{chunk: 1024, chunkDelay: 70 * time.Millisecond})
 	if res, _ := measure(t, testConfig(srv.URL), download); res.Bytes == 0 {
 		t.Error("no bytes measured")
+	}
+}
+
+func TestASlowSharedLinkStillMeasures(t *testing.T) {
+	t.Parallel()
+	// 0.4 Mbit/s shared by all eight connections, warm-up included: eight
+	// 64 KiB warm-up downloads alone take 10 s, longer than warm-up's budget.
+	// A slow link is a result, not an error.
+	const rate = 50e3
+	_, srv := newService(t, &service{chunk: 4 << 10, linkRate: rate})
+	res, err := run(t.Context(), testConfig(srv.URL), download, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit := rate * 8 / 1e6; res.Mbps > 1.05*limit || res.Mbps < 0.7*limit {
+		t.Errorf("rate %.3f Mbps through a %.1f Mbit/s link", res.Mbps, limit)
 	}
 }
 

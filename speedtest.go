@@ -124,7 +124,8 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		}()
 	}
 
-	warmup := time.NewTimer(time.Until(warmupEnd))
+	// Workers stop warming at warmupEnd themselves; this is the backstop.
+	warmup := time.NewTimer(time.Until(warmupEnd) + time.Second)
 	defer warmup.Stop()
 	for range cfg.connections {
 		select {
@@ -133,7 +134,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 				return result{}, err
 			}
 		case <-warmup.C:
-			return result{}, errors.New("speed test connection timed out")
+			return result{}, errConnectTimeout
 		}
 	}
 
@@ -332,6 +333,8 @@ type worker struct {
 // errWindowClosed ends a download whose window closed mid-request.
 var errWindowClosed = errors.New("measurement window closed")
 
+var errConnectTimeout = errors.New("speed test connection timed out")
+
 var errTooSlow = errors.New("the connection is too slow to finish an upload in the test window")
 
 // uploadClose orders worker failures against the reading of the upload
@@ -461,23 +464,37 @@ func newWorker(cfg config, dir mode) *worker {
 	return w
 }
 
-// warm opens the connection, measures its request latency and grows the
-// payload until one request takes at least 250 ms or reaches 8 MiB.
-func (w *worker) warm(ctx context.Context, deadline time.Time) error {
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+// warm opens the connection and measures its request latency. An upload
+// connection also grows its payload until one request takes at least 250 ms
+// or reaches 8 MiB.
+func (w *worker) warm(ctx context.Context, deadline time.Time) (err error) {
+	warm, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	defer func() {
+		// Warm-up's own deadline, not a cancelled run.
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			err = errConnectTimeout
+		}
+	}()
 
 	// The first probe pays for DNS, TCP and TLS; the second is a request on
 	// the warm connection.
-	if _, err := w.do(ctx, probe, 0, false); err != nil {
+	if _, err := w.do(warm, probe, 0, false); err != nil {
 		return err
 	}
-	latency, err := w.do(ctx, probe, 0, false)
+	latency, err := w.do(warm, probe, 0, false)
 	if err != nil {
 		return err
 	}
+	w.latency = latency
+	// Downloads stream the largest payload until the window closes, so a
+	// warm-up transfer would only take a slow link's time from the probes
+	// of the other connections.
+	if w.dir == download {
+		return nil
+	}
 	size := w.sizes[0]
-	took, err := w.do(ctx, w.dir, size, false)
+	took, err := w.do(warm, w.dir, size, false)
 	if err != nil {
 		return err
 	}
@@ -486,15 +503,13 @@ func (w *worker) warm(ctx context.Context, deadline time.Time) error {
 			break
 		}
 		size = next
-		if took, err = w.do(ctx, w.dir, size, false); err != nil {
+		if took, err = w.do(warm, w.dir, size, false); err != nil {
 			return err
 		}
 	}
-	w.latency, w.warmSize, w.warmTime = latency, size, took
-	if w.dir == upload {
-		// Let the server take in the warm-up uploads before measuring.
-		_, err = w.do(ctx, probe, 0, false)
-	}
+	w.warmSize, w.warmTime = size, took
+	// Let the server take in the warm-up uploads before measuring.
+	_, err = w.do(warm, probe, 0, false)
 	return err
 }
 
