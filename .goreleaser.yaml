@@ -51,6 +51,8 @@ changelog:
 
 release:
   name_template: "omarchy-speedtest {{ .Version }}"
+  # The release workflow attaches the attestations, then publishes.
+  draft: true
   # Stop before building when the token cannot publish, or when this tag is
   # already an immutable release.
   preflight:
@@ -59,10 +61,12 @@ release:
     ## Verify
 
     Every file in `checksums.txt` has a build provenance attestation, and each
-    archive an SBOM attestation, from this repository's release workflow:
+    archive an SBOM attestation, from this repository's release workflow. They
+    are also attached as `omarchy-speedtest_{{ .Version }}.intoto.jsonl`.
 
     ```sh
-    gh attestation verify omarchy-speedtest_{{ .Version }}_linux_amd64.tar.gz --repo {{ .Env.GITHUB_REPOSITORY }}
+    gh attestation verify omarchy-speedtest_{{ .Version }}_linux_amd64.tar.gz --repo {{ .Env.GITHUB_REPOSITORY }} \
+      --signer-workflow {{ .Env.GITHUB_REPOSITORY }}/.github/workflows/release-build.yml
     cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json \
       --certificate-identity "https://github.com/{{ .Env.GITHUB_REPOSITORY }}/.github/workflows/release.yml@refs/tags/{{ .Tag }}" \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com

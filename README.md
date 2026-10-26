@@ -75,9 +75,13 @@ workflows, and a dry run of the release; the `ci` check gathers them.
 
 ## Releases
 
-Pushing a `v*` tag runs the same checks, then GoReleaser builds static
-x86_64 and aarch64 binaries, reproducibly, with an SPDX SBOM per archive,
-a keyless cosign signature over `checksums.txt`, and GitHub build
-provenance and SBOM attestations. Each release says how to verify it.
+Pushing a `v*` tag runs the same checks, then waits for a maintainer to
+approve the `release` environment. GoReleaser then builds static x86_64 and
+aarch64 binaries, reproducibly, with an SPDX SBOM per archive and a keyless
+cosign signature over `checksums.txt`. The build and its provenance and
+SBOM attestations come from an isolated reusable workflow
+(`release-build.yml`), which meets SLSA v1.0 Build Level 3. The
+attestations are attached before the release is published, and releases
+are immutable from then on. Each release says how to verify it.
 Omarchy's package builds from the tagged source in
 [omarchy-pkgs](https://github.com/omacom/omarchy-pkgs).

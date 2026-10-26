@@ -48,6 +48,8 @@ first: it is the reference for how the measurement works.
 
 ## Releases
 
-Tag `vX.Y.Z` on `main` and push the tag; the release workflow does the
-rest. omarchy-pkgs watches this repository's releases and proposes the
+Tag `vX.Y.Z` on `main` and push the tag, then approve the run in the
+`release` environment; the release workflow does the rest. A published
+release is immutable: a mistake is fixed by the next version, never by
+replacing files. omarchy-pkgs watches this repository's releases and proposes the
 package update itself.

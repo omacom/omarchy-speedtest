@@ -1,0 +1,97 @@
+name: Release build
+
+# Builds, signs, attests and publishes a release. It runs only as a reusable
+# workflow called by release.yml, so the provenance names this file as its
+# signer: the build is isolated from the workflow that triggered it, which is
+# what SLSA v1.0 Build Level 3 asks for. Verify with
+#
+#   gh attestation verify FILE --repo omacom/omarchy-speedtest \
+#     --signer-workflow omacom/omarchy-speedtest/.github/workflows/release-build.yml
+#
+# The job waits in the "release" environment until a maintainer approves it,
+# so a pushed tag alone publishes nothing.
+
+on:
+  workflow_call:
+
+permissions: {}
+
+env:
+  GO_VERSION: 1.27.x
+  GORELEASER_VERSION: v2.19.0
+  COSIGN_VERSION: v3.1.4
+  SYFT_VERSION: v1.55.0
+
+jobs:
+  release:
+    name: build, attest, publish
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: write # the draft release, its assets, and publishing it
+      id-token: write # keyless signing and attestations
+      attestations: write # provenance and SBOM attestations
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: false # a release is never built from a cache
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          syft-version: ${{ env.SYFT_VERSION }}
+      # Leaves a draft: the attestations are attached before it is published,
+      # because a published release is immutable.
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: ${{ env.GORELEASER_VERSION }}
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+      - name: Name the archives
+        id: names
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Attest build provenance for every release file
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/checksums.txt
+      - name: Attest the x86_64 SBOM
+        id: sbom-amd64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/omarchy-speedtest_${{ steps.names.outputs.version }}_linux_amd64.tar.gz
+          sbom-path: dist/omarchy-speedtest_${{ steps.names.outputs.version }}_linux_amd64.tar.gz.sbom.json
+      - name: Attest the aarch64 SBOM
+        id: sbom-arm64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/omarchy-speedtest_${{ steps.names.outputs.version }}_linux_arm64.tar.gz
+          sbom-path: dist/omarchy-speedtest_${{ steps.names.outputs.version }}_linux_arm64.tar.gz.sbom.json
+      # The attestations as release files too, one Sigstore bundle per line,
+      # for offline verification: gh attestation verify FILE --bundle ...
+      - name: Attach the attestations and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.names.outputs.version }}
+          PROVENANCE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_AMD64: ${{ steps.sbom-amd64.outputs.bundle-path }}
+          SBOM_ARM64: ${{ steps.sbom-arm64.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          bundles="dist/omarchy-speedtest_${VERSION}.intoto.jsonl"
+          for b in "$PROVENANCE" "$SBOM_AMD64" "$SBOM_ARM64"; do
+            jq -c . "$b"
+          done > "$bundles"
+          gh release upload "$GITHUB_REF_NAME" "$bundles" --repo "$GITHUB_REPOSITORY"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
