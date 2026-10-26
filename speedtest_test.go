@@ -383,6 +383,18 @@ func TestASlowFirstByteDoesNotShortenTheDownloadWindow(t *testing.T) {
 	}
 }
 
+func TestAFirstByteLaterThanTheDrainIsReported(t *testing.T) {
+	t.Parallel()
+	// The window opens at the first byte, but every transfer must end
+	// within the drain allowance of the scheduled window. A service that
+	// waits longer than that cannot be measured, and the error says why.
+	_, srv := newService(t, &service{firstByteDelay: 3500 * time.Millisecond})
+	_, err := run(t.Context(), testConfig(srv.URL), download, nil)
+	if err == nil || !strings.Contains(err.Error(), "first byte") {
+		t.Fatalf("got %v, want an error about the first byte", err)
+	}
+}
+
 func TestStaggeredConnectionsCannotExceedTheLink(t *testing.T) {
 	t.Parallel()
 	// Eight connections share one 240 Mbit/s bottleneck, and half of them

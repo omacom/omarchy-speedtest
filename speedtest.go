@@ -429,15 +429,20 @@ func (w *worker) measure(ctx context.Context, started time.Time, cfg config) (ti
 		// Long streams keep the link busy. The shared window opens at the
 		// first measured byte on any connection (receive), and the requests
 		// in flight when it closes are cut.
-		ctx, cancel := context.WithDeadline(ctx, windowEnd.Add(cfg.drain))
+		streams, cancel := context.WithDeadline(ctx, windowEnd.Add(cfg.drain))
 		defer cancel()
 		w.win.register(cancel)
 		for w.win.open() {
-			if _, err := w.do(ctx, download, downloadSizes[len(downloadSizes)-1], true); err != nil {
-				if w.win.open() {
-					return time.Time{}, err
+			if _, err := w.do(streams, download, downloadSizes[len(downloadSizes)-1], true); err != nil {
+				if !w.win.open() {
+					break
 				}
-				break
+				// A window that opens within the drain allowance closes
+				// before this deadline, so only a late first byte meets it.
+				if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+					return time.Time{}, fmt.Errorf("the speed test service took more than %s to send the first byte", cfg.drain)
+				}
+				return time.Time{}, err
 			}
 		}
 		return time.Now(), nil

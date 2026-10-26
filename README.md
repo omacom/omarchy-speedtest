@@ -32,6 +32,8 @@ It exits 0 with a result, 1 when the test fails and 2 for a usage error.
   not count against the link. The requests in flight when it closes are
   cut. The result divides by the window, and one window can hold no more
   than the link carried in it, however late a connection starts.
+  A first byte later than the three-second drain allowance ends the run
+  with an error that says so.
 - Uploads, on Linux, count what the server's TCP acknowledged during the
   window: `tcpi_bytes_acked` from `TCP_INFO`, read for every connection as
   the window opens and as it closes, and as a connection closes in between.
