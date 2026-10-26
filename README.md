@@ -38,7 +38,8 @@ It exits 0 with a result, 1 when the test fails and 2 for a usage error.
   TLS record framing is taken off; the request lines, about 200 bytes per
   upload, stay in. The result divides by the window, so a slow last answer
   from the server cannot stretch the clock.
-- Elsewhere, uploads count confirmed requests: an acknowledgement does not
+- Elsewhere, and through an HTTP proxy, whose acknowledgements say nothing
+  about the service, uploads count confirmed requests: an acknowledgement does not
   prove the body arrived, but the next request answered on the same
   connection does, and the clock runs until the last one answers.
 - Upload requests are sized to take at most a second, start at 16 KiB so

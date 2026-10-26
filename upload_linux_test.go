@@ -3,6 +3,10 @@ package main
 import (
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -109,5 +113,32 @@ func TestAConnectionReplacedBeforeItClosesStillCounts(t *testing.T) {
 	}
 	if after, _ := count.delivered(); after != n {
 		t.Errorf("closing the old connection moved the count from %d to %d", n, after)
+	}
+}
+
+func TestUploadsThroughAProxyCountConfirmedRequests(t *testing.T) {
+	t.Parallel()
+	// Through a proxy the kernel would count what the proxy acknowledged,
+	// which may be buffered there, so uploads count confirmed requests: what
+	// the server itself read in full.
+	e, srv := newService(t, &service{readDelay: 15 * time.Millisecond})
+	target, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(httputil.NewSingleHostReverseProxy(target))
+	t.Cleanup(proxy.Close)
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(srv.URL)
+	cfg.proxy = http.ProxyURL(proxyURL)
+	res, _ := measure(t, cfg, upload)
+	e.mu.Lock()
+	served := e.measured
+	e.mu.Unlock()
+	if res.Bytes != served {
+		t.Errorf("counted %d bytes, server read %d in full", res.Bytes, served)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -48,6 +49,7 @@ type config struct {
 	warmup      time.Duration // connecting and warming every connection
 	window      time.Duration // measured transfer time
 	drain       time.Duration // extra time for the last uploads to be confirmed
+	proxy       func(*http.Request) (*url.URL, error)
 	// Count uploads only by confirmed requests, even where the kernel can
 	// say what was acknowledged. Tests use it to exercise that path.
 	confirmedOnly bool
@@ -60,6 +62,7 @@ func defaultConfig() config {
 		warmup:      6 * time.Second,
 		window:      5 * time.Second,
 		drain:       3 * time.Second,
+		proxy:       http.ProxyFromEnvironment,
 	}
 }
 
@@ -140,7 +143,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	// Uploads count what the server's TCP acknowledged during the window,
 	// where the kernel says, so a slow last answer cannot stretch the clock.
 	var socket *socketCount
-	if dir == upload && !cfg.confirmedOnly {
+	if dir == upload && !cfg.confirmedOnly && !viaProxy(cfg) {
 		socket = newSocketCount(workers, strings.HasPrefix(cfg.url, "https://"))
 	}
 	total := func() int64 {
@@ -327,7 +330,7 @@ func newWorker(cfg config, dir mode) *worker {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
 	transport := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
+		Proxy:               cfg.proxy,
 		TLSClientConfig:     cfg.tls,
 		TLSHandshakeTimeout: 3 * time.Second,
 		MaxConnsPerHost:     1,
@@ -624,6 +627,20 @@ func (c *countedConn) Close() error {
 	}
 	w.socketMu.Unlock()
 	return c.TCPConn.Close()
+}
+
+// viaProxy reports whether requests to the service go through a proxy,
+// whose TCP acknowledgements say nothing about the service.
+func viaProxy(cfg config) bool {
+	if cfg.proxy == nil {
+		return false
+	}
+	target, err := url.Parse(cfg.url)
+	if err != nil {
+		return true
+	}
+	proxy, err := cfg.proxy(&http.Request{URL: target})
+	return err != nil || proxy != nil
 }
 
 // socketCount reads how many bytes the server's TCP has acknowledged on
