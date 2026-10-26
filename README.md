@@ -57,6 +57,7 @@ It needs Go 1.27 and nothing outside the standard library.
 ```sh
 go build -trimpath -ldflags='-s -w' -o omarchy-speedtest .
 go test -race ./...
+go test -run='^$' -fuzz='^FuzzChooseSize$' -fuzztime=30s .
 ```
 
 The tests run a local stand-in for the service (`speedtest_test.go`) and
@@ -65,5 +66,18 @@ on the same link, slow and latent links, faults injected in the measured
 phase, connection replacement and HTTP/2-capable servers. The process
 tests (`main_test.go`, `parent_linux_test.go`) run the real `main`:
 streamed progress, signals, a stale parent and, on Linux, parent death.
+The fuzz tests (`fuzz_test.go`) hold the upload sizing and the
+acknowledgement parser to their invariants.
 
-`packaging/PKGBUILD` is the Arch package recipe.
+CI runs the tests with the race detector on x86_64 and aarch64,
+golangci-lint, govulncheck, the fuzz tests, actionlint and zizmor on the
+workflows, and a dry run of the release; the `ci` check gathers them.
+
+## Releases
+
+Pushing a `v*` tag runs the same checks, then GoReleaser builds static
+x86_64 and aarch64 binaries, reproducibly, with an SPDX SBOM per archive,
+a keyless cosign signature over `checksums.txt`, and GitHub build
+provenance and SBOM attestations. Each release says how to verify it.
+Omarchy's package builds from the tagged source in
+[omarchy-pkgs](https://github.com/omacom/omarchy-pkgs).
