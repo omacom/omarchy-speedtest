@@ -35,3 +35,21 @@ func TestAReplacedConnectionKeepsItsCount(t *testing.T) {
 		t.Errorf("counted %d bytes, server read %d in full", res.Bytes, served)
 	}
 }
+
+func TestAnEarlyFinishKeepsTheKernelCount(t *testing.T) {
+	t.Parallel()
+	// No upload is ever confirmed (each connection closes after it), and
+	// slow answers make every worker stop before the window ends. The
+	// server's TCP acknowledged the bytes all the same, so they count.
+	e, srv := newService(t, &service{closeAfter: true, readDelay: 15 * time.Millisecond, lateAnswer: time.Second, lateAfter: 2500 * time.Millisecond})
+	res, err := run(t.Context(), testConfig(srv.URL), upload, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	served := e.measured
+	e.mu.Unlock()
+	if res.Bytes < served {
+		t.Errorf("counted %d bytes, server read %d in full", res.Bytes, served)
+	}
+}

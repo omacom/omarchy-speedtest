@@ -149,6 +149,15 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		}
 		return confirmed()
 	}
+	// Without a measured upload the kernel only counted the closing probes.
+	tooSlow := func() bool {
+		for _, w := range workers {
+			if w.started.Load() > 0 {
+				return false
+			}
+		}
+		return true
+	}
 
 	started = time.Now()
 	socket.start()
@@ -165,7 +174,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		select {
 		case <-windowEnd.C:
 			if n, ok := socket.delivered(); ok {
-				if n == 0 {
+				if tooSlow() {
 					return result{}, errors.New("the connection is too slow to finish an upload in the test window")
 				}
 				return result{
@@ -190,6 +199,16 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		case <-limit.C:
 			return result{}, errors.New("speed test timed out")
 		}
+	}
+
+	// Every worker stopped before the window closed. A kernel count still
+	// holds, over the time the run took.
+	if n, ok := socket.delivered(); ok {
+		if tooSlow() {
+			return result{}, errors.New("the connection is too slow to finish an upload in the test window")
+		}
+		elapsed := ended.Sub(started)
+		return result{Bytes: n, Seconds: elapsed.Seconds(), Mbps: mbps(n, elapsed), Connections: cfg.connections}, nil
 	}
 
 	bytes := confirmed()
@@ -233,7 +252,8 @@ type worker struct {
 	// request answered on the same connection does, so the bytes wait here
 	// until then.
 	pending int64
-	acked   int64 // measured upload bytes acknowledged, confirmed or not
+	acked   int64        // measured upload bytes acknowledged, confirmed or not
+	started atomic.Int64 // measured uploads started
 
 	latency  time.Duration // a request on the warm connection
 	warmSize int64
@@ -415,6 +435,7 @@ func (w *worker) measure(ctx context.Context, started time.Time, cfg config) (ti
 		if size, ok = chooseSize(w.sizes, size, rate, w.latency, time.Until(windowEnd)); !ok {
 			break
 		}
+		w.started.Add(1)
 		took, err := w.do(ctx, upload, size, true)
 		if err != nil {
 			return time.Time{}, err
