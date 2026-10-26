@@ -68,7 +68,7 @@ release:
     gh attestation verify omarchy-speedtest_{{ .Version }}_linux_amd64.tar.gz --repo {{ .Env.GITHUB_REPOSITORY }} \
       --signer-workflow {{ .Env.GITHUB_REPOSITORY }}/.github/workflows/release-build.yml
     cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json \
-      --certificate-identity "https://github.com/{{ .Env.GITHUB_REPOSITORY }}/.github/workflows/release.yml@refs/tags/{{ .Tag }}" \
+      --certificate-identity "https://github.com/{{ .Env.GITHUB_REPOSITORY }}/.github/workflows/release-build.yml@refs/tags/{{ .Tag }}" \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com
     sha256sum --ignore-missing -c checksums.txt
     ```
