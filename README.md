@@ -25,17 +25,31 @@ It exits 0 with a result, 1 when the test fails and 2 for a usage error.
   window between the payload and the link.
 - Connecting (DNS, TCP, TLS) and warm-up stay outside the measurement. Each
   connection measures its request latency and grows its payload until a
-  request takes 250 ms, then all start the five-second window together.
-- Only payload counts, never other traffic on the machine. Downloads count
-  body bytes as they arrive and stop counting when the window closes.
-- An upload's acknowledgement does not prove its body arrived; the next
-  request answered on the same connection does. So an upload counts once
-  that request answers, and if the connection is replaced in between, its
-  last upload is not counted. Upload requests are sized to take at most a
-  second, start at 16 KiB so slow uplinks still finish one inside the
-  window, and grow one size at a time.
-- The result is the counted payload over the elapsed time: the window for
-  downloads, and until the last upload is confirmed for uploads.
+  request takes 250 ms, then the five-second window starts.
+- Only payload counts, never other traffic on the machine.
+- Downloads count body bytes as they arrive, in one window that opens at
+  the first measured byte on any connection, so the wait for that byte does
+  not count against the link. The requests in flight when it closes are
+  cut. The result divides by the window, and one window can hold no more
+  than the link carried in it, however late a connection starts.
+  A first byte later than the three-second drain allowance ends the run
+  with an error that says so.
+- Uploads, on Linux, count what the server's TCP acknowledged during the
+  window: `tcpi_bytes_acked` from `TCP_INFO`, read for every connection as
+  the window opens and as it closes, and as a connection closes in between.
+  The closing read runs on the window's own timer, and progress is
+  reported from its own goroutine, so a reader that falls behind cannot
+  change the result.
+  TLS record framing is taken off; the request lines, about 200 bytes per
+  upload, stay in. The result divides by the window, so a slow last answer
+  from the server cannot stretch the clock.
+- Elsewhere, and through an HTTP proxy, whose acknowledgements say nothing
+  about the service, uploads count confirmed requests: an acknowledgement does not
+  prove the body arrived, but the next request answered on the same
+  connection does, and the clock runs until the last one answers.
+- Upload requests are sized to take at most a second, start at 16 KiB so
+  slow uplinks still finish one inside the window, and grow one size at a
+  time.
 
 On Linux the client asks for `SIGTERM` when its parent exits
 (`PR_SET_PDEATHSIG`), and exits if its parent is no longer the process in

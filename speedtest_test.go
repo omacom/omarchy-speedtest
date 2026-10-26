@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -20,26 +21,51 @@ import (
 // served in the measured phase so a test can compare the client's result
 // with the server's own count.
 type service struct {
-	latency    time.Duration // before every response
-	chunk      int           // download write size
-	chunkDelay time.Duration // after every download write
-	readDelay  time.Duration // after every 64 KiB of upload read
-	upRate     float64       // upload bytes per second per connection, if set
-	truncate   bool          // send half of every measured download
-	badAck     bool          // acknowledge one byte less than a measured upload
-	closeAfter bool          // close the connection after measured uploads
-	closeOnce  bool          // close one connection after its third measured upload
-	shortBody  bool          // honestly send half of every measured download
-	earlyAck   bool          // acknowledge measured uploads before reading them, then close
+	latency     time.Duration // before every response
+	chunk       int           // download write size
+	chunkDelay  time.Duration // after every download write
+	readDelay   time.Duration // after every 64 KiB of upload read
+	upRate      float64       // upload bytes per second per connection, if set
+	truncate    bool          // send half of every measured download
+	badAck      bool          // acknowledge one byte less than a measured upload
+	badAckAfter time.Duration // from this long into the measurement
+	closeAfter  bool          // close the connection after measured uploads
+	closeOnce   bool          // close one connection after its third measured upload
+	shortBody   bool          // honestly send half of every measured download
+	earlyAck    bool          // acknowledge measured uploads before reading them, then close
+	// Hold back the first byte of every measured download, like a slow first
+	// byte or a TCP ramp at the start of the window.
+	firstByteDelay time.Duration
+	// One bottleneck for every measured download, in bytes per second, and
+	// a first byte held back a second on every other connection.
+	sharedRate       float64
+	staggerFirstByte bool
+	// Answer measured uploads that arrive lateAfter or later into the
+	// measurement only after lateAnswer: the slow last answer that used to
+	// stretch the upload clock.
+	lateAnswer, lateAfter time.Duration
 
 	mu          sync.Mutex
 	measured    int64     // payload bytes in the measured phase
 	first, last time.Time // first measured request, last measured byte
-	uploads     []int64   // measured upload sizes
-	perConn     map[string]int
-	dropped     int64 // the upload whose connection closeOnce closed
+	firstWrite  time.Time // first measured byte written
+	// Measured upload bytes as they arrive, before any answer.
+	rxBytes         int64
+	rxFirst, rxLast time.Time
+	rxTimes         []time.Time // arrival of each measured upload chunk
+	rxSizes         []int64
+	// Read slower from slowAfter into the measurement on, so uploads are
+	// still in flight when the window closes.
+	slowAfter     time.Duration
+	slowReadDelay time.Duration
+	serverConns   []net.Conn // every connection the service accepted
+	uploads       []int64    // measured upload sizes
+	perConn       map[string]int
+	dropped       int64 // the upload whose connection closeOnce closed
 
 	closed   atomic.Bool
+	paceNext time.Time      // when the shared bottleneck is next free
+	seen     map[string]int // measured download requests per connection
 	requests atomic.Int64
 	http2    atomic.Int64 // requests that did not use HTTP/1.1
 	noise    atomic.Int64 // bytes served to unrelated traffic
@@ -52,10 +78,13 @@ func newService(t *testing.T, e *service) (*service, *httptest.Server) {
 		e.chunk = 64 << 10
 	}
 	srv := httptest.NewUnstartedServer(e)
-	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+	srv.Config.ConnState = func(c net.Conn, state http.ConnState) {
 		switch state {
 		case http.StateNew:
 			e.open.Add(1)
+			e.mu.Lock()
+			e.serverConns = append(e.serverConns, c)
+			e.mu.Unlock()
 		case http.StateClosed, http.StateHijacked:
 			e.open.Add(-1)
 		case http.StateActive, http.StateIdle:
@@ -77,6 +106,9 @@ func (e *service) mark(n int64) {
 	if n > 0 {
 		e.measured += n
 		e.last = now
+		if e.firstWrite.IsZero() {
+			e.firstWrite = now
+		}
 	}
 }
 
@@ -102,6 +134,19 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if measured {
 			e.mark(0)
+			delay := e.firstByteDelay
+			if e.staggerFirstByte {
+				e.mu.Lock()
+				if e.seen == nil {
+					e.seen = map[string]int{}
+				}
+				if e.seen[r.RemoteAddr] == 0 && len(e.seen)%2 == 1 {
+					delay = time.Second
+				}
+				e.seen[r.RemoteAddr]++
+				e.mu.Unlock()
+			}
+			time.Sleep(delay)
 		}
 		truncate, short := e.truncate && measured, e.shortBody && measured
 		limit := size
@@ -114,6 +159,7 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		e.serve(w, limit, e.chunk, e.chunkDelay, func(n int64) {
 			if measured {
+				e.pace(n)
 				e.mark(n)
 			}
 		})
@@ -121,10 +167,12 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			panic(http.ErrAbortHandler)
 		}
 	case "/upload":
+		late := false
 		if measured {
 			e.mark(0)
 			e.mu.Lock()
 			e.uploads = append(e.uploads, r.ContentLength)
+			late = e.lateAnswer > 0 && time.Since(e.first) >= e.lateAfter
 			e.mu.Unlock()
 		}
 		if measured && e.earlyAck {
@@ -145,13 +193,32 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for {
 			n, err := io.ReadFull(r.Body, buf)
 			got += int64(n)
+			if measured && n > 0 {
+				e.mu.Lock()
+				if e.rxFirst.IsZero() {
+					e.rxFirst = time.Now()
+				}
+				e.rxBytes += int64(n)
+				e.rxLast = time.Now()
+				e.rxTimes = append(e.rxTimes, e.rxLast)
+				e.rxSizes = append(e.rxSizes, int64(n))
+				e.mu.Unlock()
+			}
 			if e.upRate > 0 {
 				time.Sleep(time.Duration(float64(n) / e.upRate * float64(time.Second)))
 			}
 			if err != nil {
 				break
 			}
-			time.Sleep(e.readDelay)
+			delay := e.readDelay
+			if e.slowAfter > 0 {
+				e.mu.Lock()
+				if !e.first.IsZero() && time.Since(e.first) > e.slowAfter {
+					delay = e.slowReadDelay
+				}
+				e.mu.Unlock()
+			}
+			time.Sleep(delay)
 		}
 		if got != r.ContentLength {
 			return
@@ -160,7 +227,11 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			e.mark(got)
 		}
 		if e.badAck && measured {
-			got--
+			e.mu.Lock()
+			if time.Since(e.first) >= e.badAckAfter {
+				got--
+			}
+			e.mu.Unlock()
 		}
 		replace := false
 		if measured && e.closeOnce {
@@ -177,10 +248,29 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if measured && (e.closeAfter || replace) {
 			w.Header().Set("Connection", "close")
 		}
+		if late {
+			time.Sleep(e.lateAnswer)
+		}
 		_, _ = w.Write([]byte(`{"acceptedBytes":` + strconv.FormatInt(got, 10) + `}`))
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// pace holds a write until the shared bottleneck has room for it.
+func (e *service) pace(n int64) {
+	if e.sharedRate == 0 {
+		return
+	}
+	e.mu.Lock()
+	now := time.Now()
+	if e.paceNext.Before(now) {
+		e.paceNext = now
+	}
+	at := e.paceNext
+	e.paceNext = e.paceNext.Add(time.Duration(float64(n) / e.sharedRate * float64(time.Second)))
+	e.mu.Unlock()
+	time.Sleep(time.Until(at))
 }
 
 func (e *service) serve(w http.ResponseWriter, size int64, chunk int, delay time.Duration, sent func(int64)) {
@@ -223,9 +313,13 @@ func measure(t *testing.T, cfg config, dir mode) (result, []float64) {
 
 func TestCountsOnlyTestPayloads(t *testing.T) {
 	t.Parallel()
-	for _, dir := range []mode{download, upload} {
-		name := map[mode]string{download: "down", upload: "up"}[dir]
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		dir           mode
+		confirmedOnly bool
+	}{{"down", download, false}, {"up", upload, false}, {"up/confirmed", upload, true}} {
+		dir := tc.dir
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			e, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond, readDelay: 15 * time.Millisecond})
 
@@ -243,7 +337,9 @@ func TestCountsOnlyTestPayloads(t *testing.T) {
 					_ = resp.Body.Close()
 				}
 			})
-			res, steps := measure(t, testConfig(srv.URL), dir)
+			cfg := testConfig(srv.URL)
+			cfg.confirmedOnly = tc.confirmedOnly
+			res, steps := measure(t, cfg, dir)
 			stop()
 			wg.Wait()
 
@@ -254,8 +350,14 @@ func TestCountsOnlyTestPayloads(t *testing.T) {
 			if res.Mbps < 0.8*want || res.Mbps > 1.2*want {
 				t.Errorf("rate %.1f Mbps, server saw %.1f Mbps", res.Mbps, want)
 			}
-			if dir == upload && res.Bytes != served {
+			// Confirmed requests are exactly what the server read in full. The
+			// kernel also counts request lines and the bytes it acknowledged
+			// before the window closed, so never less.
+			if tc.confirmedOnly && res.Bytes != served {
 				t.Errorf("counted %d upload bytes, server acknowledged %d", res.Bytes, served)
+			}
+			if dir == upload && res.Bytes < served {
+				t.Errorf("counted %d upload bytes, server read %d in full", res.Bytes, served)
 			}
 			if dir == download && res.Bytes > served {
 				t.Errorf("counted %d download bytes, server sent only %d", res.Bytes, served)
@@ -270,6 +372,45 @@ func TestCountsOnlyTestPayloads(t *testing.T) {
 				t.Errorf("connections = %d", res.Connections)
 			}
 		})
+	}
+}
+
+func TestASlowFirstByteDoesNotShortenTheDownloadWindow(t *testing.T) {
+	t.Parallel()
+	// The window opens at the first measured byte, so a second without
+	// bytes at the start is not counted against the link.
+	e, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond, firstByteDelay: time.Second})
+	res, _ := measure(t, testConfig(srv.URL), download)
+	e.mu.Lock()
+	want := mbps(e.measured, e.last.Sub(e.firstWrite))
+	e.mu.Unlock()
+	if res.Mbps < 0.95*want || res.Mbps > 1.05*want {
+		t.Errorf("rate %.1f Mbps, server sent %.1f Mbps once it started", res.Mbps, want)
+	}
+}
+
+func TestAFirstByteLaterThanTheDrainIsReported(t *testing.T) {
+	t.Parallel()
+	// The window opens at the first byte, but every transfer must end
+	// within the drain allowance of the scheduled window. A service that
+	// waits longer than that cannot be measured, and the error says why.
+	_, srv := newService(t, &service{firstByteDelay: 3500 * time.Millisecond})
+	_, err := run(t.Context(), testConfig(srv.URL), download, nil)
+	if err == nil || !strings.Contains(err.Error(), "first byte") {
+		t.Fatalf("got %v, want an error about the first byte", err)
+	}
+}
+
+func TestStaggeredConnectionsCannotExceedTheLink(t *testing.T) {
+	t.Parallel()
+	// Eight connections share one 240 Mbit/s bottleneck, and half of them
+	// see their first byte a second late. Bytes over a window must never
+	// exceed what the bottleneck carries in that window.
+	const rate = 30e6
+	_, srv := newService(t, &service{sharedRate: rate, staggerFirstByte: true})
+	res, _ := measure(t, testConfig(srv.URL), download)
+	if limit := rate * 8 / 1e6; res.Mbps > 1.05*limit || res.Mbps < 0.85*limit {
+		t.Errorf("rate %.1f Mbps through a %.0f Mbit/s bottleneck", res.Mbps, limit)
 	}
 }
 
@@ -300,6 +441,21 @@ func TestVerySlowUplinksStillMeasure(t *testing.T) {
 	}
 }
 
+func TestConfirmedUploadsStopWhenAnswersTurnSlow(t *testing.T) {
+	t.Parallel()
+	// From 2.5 s into the window every answer comes a second late. Without
+	// the kernel's count the last answer ends the clock, so the client must
+	// stop starting uploads it cannot have answered inside the window. The
+	// rate estimate, which absorbs the late answers, is what stops it.
+	_, srv := newService(t, &service{readDelay: 15 * time.Millisecond, lateAnswer: time.Second, lateAfter: 2500 * time.Millisecond})
+	cfg := testConfig(srv.URL)
+	cfg.confirmedOnly = true
+	res, _ := measure(t, cfg, upload)
+	if res.Seconds > 5.3 {
+		t.Errorf("measured over %.2f s, want the 5 s window and one confirmation", res.Seconds)
+	}
+}
+
 func TestLatencyDoesNotPinUploadsToSmallRequests(t *testing.T) {
 	t.Parallel()
 	e, srv := newService(t, &service{latency: 50 * time.Millisecond})
@@ -314,27 +470,30 @@ func TestLatencyDoesNotPinUploadsToSmallRequests(t *testing.T) {
 func TestRejects(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name string
-		svc  *service
-		dir  mode
-		want string
+		name          string
+		svc           *service
+		dir           mode
+		want          string
+		confirmedOnly bool
 	}{
-		{"short acknowledgement", &service{badAck: true}, upload, "acknowledge"},
-		{"truncated download", &service{truncate: true}, download, "EOF"},
-		{"uploads never confirmed on their connection", &service{closeAfter: true}, upload, "confirm"},
+		{"short acknowledgement", &service{badAck: true}, upload, "acknowledge", false},
+		{"truncated download", &service{truncate: true}, download, "EOF", false},
+		{"uploads never confirmed on their connection", &service{closeAfter: true}, upload, "confirm", true},
 		// Acknowledgements that arrive before the body make request times
 		// meaningless, so which check stops the test varies: any error will do,
 		// a result will not.
-		{"early acknowledgement on a closing connection", &service{earlyAck: true}, upload, ""},
+		{"early acknowledgement on a closing connection", &service{earlyAck: true}, upload, "", true},
 		// 3.2 kB/s per connection: warm-up finishes, but no 16 KiB upload fits
 		// the window. A working link must not read as zero.
-		{"uplink too slow for the window", &service{upRate: 3200}, upload, "too slow"},
-		{"download shorter than requested", &service{shortBody: true}, download, "incomplete"},
+		{"uplink too slow for the window", &service{upRate: 3200}, upload, "too slow", false},
+		{"download shorter than requested", &service{shortBody: true}, download, "incomplete", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			_, srv := newService(t, tc.svc)
-			_, err := run(t.Context(), testConfig(srv.URL), tc.dir, nil)
+			cfg := testConfig(srv.URL)
+			cfg.confirmedOnly = tc.confirmedOnly
+			_, err := run(t.Context(), cfg, tc.dir, nil)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("err = %v, want it to mention %q", err, tc.want)
 			}
@@ -342,12 +501,14 @@ func TestRejects(t *testing.T) {
 	}
 }
 
-func TestReplacedConnectionDropsOnlyItsUnconfirmedUpload(t *testing.T) {
+func TestConfirmedCountDropsOnlyAReplacedConnectionsUnconfirmedUpload(t *testing.T) {
 	t.Parallel()
 	// The replaced connection has already had two uploads confirmed; only
 	// the one its replacement leaves unconfirmed may go uncounted.
 	e, srv := newService(t, &service{closeOnce: true, readDelay: 15 * time.Millisecond})
-	res, _ := measure(t, testConfig(srv.URL), upload)
+	cfg := testConfig(srv.URL)
+	cfg.confirmedOnly = true
+	res, _ := measure(t, cfg, upload)
 	e.mu.Lock()
 	served, dropped := e.measured, e.dropped
 	e.mu.Unlock()
@@ -428,11 +589,36 @@ func TestResultJSON(t *testing.T) {
 }
 
 func TestBytesAfterTheWindowAreNotCounted(t *testing.T) {
-	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Millisecond))
-	defer cancel()
 	w := newWorker(testConfig("http://127.0.0.1:1"), download)
-	err := w.receive(ctx, bytes.NewReader(make([]byte, 64<<10)), 64<<10, true)
+	w.win = newDownloadWindow(time.Second)
+	w.win.closesAt(time.Now().Add(-2 * time.Second))
+	err := w.receive(bytes.NewReader(make([]byte, 64<<10)), 64<<10, true)
 	if err == nil || w.bytes.Load() != 0 {
 		t.Errorf("err = %v, counted %d bytes after the window", err, w.bytes.Load())
+	}
+}
+
+func TestAFailureCountsByWhetherTheWindowHadClosed(t *testing.T) {
+	t.Parallel()
+	bad := errors.New("bad acknowledgement")
+	read := func() (int64, bool) { return 100, true }
+
+	// Failed first: the close carries the failure, whatever order the run
+	// loop reads them in.
+	var before uploadClose
+	if late := before.fail(bad); late {
+		t.Error("a failure before the close was called late")
+	}
+	if c := before.close(read); !errors.Is(c.err, bad) {
+		t.Errorf("the close carried %v, want the earlier failure", c.err)
+	}
+
+	// Closed first: the failure is late and the count stands.
+	var after uploadClose
+	if c := after.close(read); c.err != nil || c.bytes != 100 || !c.ok {
+		t.Errorf("the close gave %+v, want the count", c)
+	}
+	if late := after.fail(bad); !late {
+		t.Error("a failure after the close was not called late")
 	}
 }
