@@ -31,10 +31,14 @@ type service struct {
 	closeOnce  bool          // close one connection after its third measured upload
 	shortBody  bool          // honestly send half of every measured download
 	earlyAck   bool          // acknowledge measured uploads before reading them, then close
+	// Hold back the first byte of every measured download, like a slow first
+	// byte or a TCP ramp at the start of the window.
+	firstByteDelay time.Duration
 
 	mu          sync.Mutex
 	measured    int64     // payload bytes in the measured phase
 	first, last time.Time // first measured request, last measured byte
+	firstWrite  time.Time // first measured byte written
 	uploads     []int64   // measured upload sizes
 	perConn     map[string]int
 	dropped     int64 // the upload whose connection closeOnce closed
@@ -77,6 +81,9 @@ func (e *service) mark(n int64) {
 	if n > 0 {
 		e.measured += n
 		e.last = now
+		if e.firstWrite.IsZero() {
+			e.firstWrite = now
+		}
 	}
 }
 
@@ -102,6 +109,7 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if measured {
 			e.mark(0)
+			time.Sleep(e.firstByteDelay)
 		}
 		truncate, short := e.truncate && measured, e.shortBody && measured
 		limit := size
@@ -273,6 +281,20 @@ func TestCountsOnlyTestPayloads(t *testing.T) {
 	}
 }
 
+func TestASlowFirstByteDoesNotShortenTheDownloadWindow(t *testing.T) {
+	t.Parallel()
+	// Every connection's window opens at its first measured byte, so a
+	// second without bytes at the start is not counted against the link.
+	e, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond, firstByteDelay: time.Second})
+	res, _ := measure(t, testConfig(srv.URL), download)
+	e.mu.Lock()
+	want := mbps(e.measured, e.last.Sub(e.firstWrite))
+	e.mu.Unlock()
+	if res.Mbps < 0.95*want || res.Mbps > 1.05*want {
+		t.Errorf("rate %.1f Mbps, server sent %.1f Mbps once it started", res.Mbps, want)
+	}
+}
+
 func TestSlowHealthyDownloadsFinish(t *testing.T) {
 	t.Parallel()
 	_, srv := newService(t, &service{chunkDelay: 240 * time.Millisecond})
@@ -428,10 +450,9 @@ func TestResultJSON(t *testing.T) {
 }
 
 func TestBytesAfterTheWindowAreNotCounted(t *testing.T) {
-	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Millisecond))
-	defer cancel()
 	w := newWorker(testConfig("http://127.0.0.1:1"), download)
-	err := w.receive(ctx, bytes.NewReader(make([]byte, 64<<10)), 64<<10, true)
+	w.windowEnd = time.Now().Add(-time.Millisecond)
+	err := w.receive(bytes.NewReader(make([]byte, 64<<10)), 64<<10, true)
 	if err == nil || w.bytes.Load() != 0 {
 		t.Errorf("err = %v, counted %d bytes after the window", err, w.bytes.Load())
 	}

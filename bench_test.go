@@ -33,12 +33,11 @@ func BenchmarkReceive(b *testing.B) {
 	for _, record := range []int64{1 << 10, 16 << 10} {
 		b.Run("record="+strconv.FormatInt(record>>10, 10)+"KiB", func(b *testing.B) {
 			w := newWorker(testConfig("http://127.0.0.1:1"), download)
-			ctx, cancel := context.WithDeadline(b.Context(), time.Now().Add(time.Hour))
-			defer cancel()
+			w.window = time.Hour
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
-				if err := w.receive(ctx, &chunkReader{left: size, n: record}, size, true); err != nil {
+				if err := w.receive(&chunkReader{left: size, n: record}, size, true); err != nil {
 					b.Fatal(err)
 				}
 			}

@@ -168,14 +168,12 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		return result{}, errors.New("the connection is too slow to finish an upload in the test window")
 	}
 
-	// A download's last request is cut at the window, so the window is its
-	// elapsed time. Uploads end when the server confirms the last byte.
-	if dir == download {
-		if windowEnd := started.Add(cfg.window); ended.After(windowEnd) {
-			ended = windowEnd
-		}
-	}
+	// Every download connection measured for exactly one window, from its
+	// own first byte. Uploads end when the server confirms the last byte.
 	elapsed := ended.Sub(started)
+	if dir == download {
+		elapsed = cfg.window
+	}
 	return result{
 		Bytes:       bytes,
 		Seconds:     elapsed.Seconds(),
@@ -206,7 +204,16 @@ type worker struct {
 	latency  time.Duration // a request on the warm connection
 	warmSize int64
 	warmTime time.Duration
+
+	// A download connection's window opens at its first measured byte, so
+	// the time to that byte is not counted against the link.
+	window      time.Duration
+	windowEnd   time.Time          // zero until the first measured byte
+	closeWindow context.CancelFunc // cuts the request in flight at windowEnd
 }
+
+// errWindowClosed ends a download whose window closed mid-request.
+var errWindowClosed = errors.New("measurement window closed")
 
 func newWorker(cfg config, dir mode) *worker {
 	var protocols http.Protocols
@@ -284,19 +291,23 @@ func (w *worker) warm(ctx context.Context, deadline time.Time) error {
 func (w *worker) measure(ctx context.Context, started time.Time, cfg config) (time.Time, error) {
 	windowEnd := started.Add(cfg.window)
 	if w.dir == download {
-		// Long streams keep the link busy. The last request is cut at the
-		// window, and bytes that arrive after it are not counted.
-		ctx, cancel := context.WithDeadline(ctx, windowEnd)
+		// Long streams keep the link busy. The window opens at the first
+		// measured byte (receive), and the request in flight when it closes
+		// is cut. A first byte later than the drain allowance is cut short
+		// with the rest, at the limit.
+		ctx, cancel := context.WithDeadline(ctx, windowEnd.Add(cfg.drain))
 		defer cancel()
-		for time.Now().Before(windowEnd) {
+		w.window, w.closeWindow = cfg.window, cancel
+		open := func() bool { return w.windowEnd.IsZero() || time.Now().Before(w.windowEnd) }
+		for open() {
 			if _, err := w.do(ctx, download, downloadSizes[len(downloadSizes)-1], true); err != nil {
-				if time.Now().Before(windowEnd) {
+				if open() {
 					return time.Time{}, err
 				}
 				break
 			}
 		}
-		return time.Now(), nil
+		return w.windowEnd, nil
 	}
 
 	ctx, cancel := context.WithDeadline(ctx, windowEnd.Add(cfg.drain))
@@ -396,28 +407,30 @@ func (w *worker) do(ctx context.Context, m mode, size int64, measured bool) (tim
 	case probe:
 		// A 204 has no body to read.
 	case download:
-		err = w.receive(ctx, resp.Body, size, measured)
+		err = w.receive(resp.Body, size, measured)
 	case upload:
 		err = w.acknowledge(resp.Body, size, measured)
 	}
 	return time.Since(begin), err
 }
 
-// receive reads a download, counting measured bytes only while the
-// request's context is live, so bytes after the window are never counted.
-func (w *worker) receive(ctx context.Context, body io.Reader, size int64, measured bool) error {
-	deadline, bounded := ctx.Deadline()
+// receive reads a download. Its first measured byte opens the worker's
+// window, and bytes that arrive after the window are never counted.
+func (w *worker) receive(body io.Reader, size int64, measured bool) error {
 	var got int64
 	for {
 		n, err := body.Read(w.buf)
 		if n > 0 {
-			if measured && bounded && !time.Now().Before(deadline) {
-				return context.DeadlineExceeded
-			}
-			got += int64(n)
 			if measured {
+				now := time.Now()
+				if w.windowEnd.IsZero() {
+					w.openWindow(now)
+				} else if !now.Before(w.windowEnd) {
+					return errWindowClosed
+				}
 				w.bytes.Add(int64(n))
 			}
+			got += int64(n)
 		}
 		if err == io.EOF {
 			break
@@ -430,6 +443,13 @@ func (w *worker) receive(ctx context.Context, body io.Reader, size int64, measur
 		return errors.New("incomplete test download")
 	}
 	return nil
+}
+
+func (w *worker) openWindow(now time.Time) {
+	w.windowEnd = now.Add(w.window)
+	if w.closeWindow != nil {
+		time.AfterFunc(w.window, w.closeWindow)
+	}
 }
 
 // acknowledge checks the server accepted the whole upload and holds a
