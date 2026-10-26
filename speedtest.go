@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -50,9 +51,16 @@ type config struct {
 	window      time.Duration // measured transfer time
 	drain       time.Duration // extra time for the last uploads to be confirmed
 	proxy       func(*http.Request) (*url.URL, error)
+	test        *testHooks // nil outside tests
+}
+
+// testHooks are knobs only tests turn.
+type testHooks struct {
 	// Count uploads only by confirmed requests, even where the kernel can
-	// say what was acknowledged. Tests use it to exercise that path.
+	// say what was acknowledged, to exercise that path.
 	confirmedOnly bool
+	// Runs on each new socket before it connects, to slow connecting down.
+	dialControl func(network, address string, c syscall.RawConn) error
 }
 
 func defaultConfig() config {
@@ -124,17 +132,10 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		}()
 	}
 
-	// Workers stop warming at warmupEnd themselves; this is the backstop.
-	warmup := time.NewTimer(time.Until(warmupEnd) + time.Second)
-	defer warmup.Stop()
+	// Every worker reports by warmupEnd: warm-up runs under that deadline.
 	for range cfg.connections {
-		select {
-		case err := <-ready:
-			if err != nil {
-				return result{}, err
-			}
-		case <-warmup.C:
-			return result{}, errConnectTimeout
+		if err := <-ready; err != nil {
+			return result{}, err
 		}
 	}
 
@@ -147,7 +148,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	// Uploads count what the server's TCP acknowledged during the window,
 	// where the kernel says, so a slow last answer cannot stretch the clock.
 	var socket *socketCount
-	if dir == upload && !cfg.confirmedOnly && !viaProxy(cfg) {
+	if dir == upload && (cfg.test == nil || !cfg.test.confirmedOnly) && !viaProxy(cfg) {
 		socket = newSocketCount(workers, strings.HasPrefix(cfg.url, "https://"))
 	}
 	total := func() int64 {
@@ -454,6 +455,9 @@ func newWorker(cfg config, dir mode) *worker {
 		w.sizes = uploadSizes
 	}
 	var dialer net.Dialer
+	if cfg.test != nil {
+		dialer.Control = cfg.test.dialControl
+	}
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		conn, err := dialer.DialContext(ctx, network, address)
 		tcp, ok := conn.(*net.TCPConn)

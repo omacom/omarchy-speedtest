@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -351,7 +352,7 @@ func TestCountsOnlyTestPayloads(t *testing.T) {
 				}
 			})
 			cfg := testConfig(srv.URL)
-			cfg.confirmedOnly = tc.confirmedOnly
+			cfg.test = &testHooks{confirmedOnly: tc.confirmedOnly}
 			res, steps := measure(t, cfg, dir)
 			stop()
 			wg.Wait()
@@ -478,7 +479,7 @@ func TestConfirmedUploadsStopWhenAnswersTurnSlow(t *testing.T) {
 	// rate estimate, which absorbs the late answers, is what stops it.
 	_, srv := newService(t, &service{readDelay: 15 * time.Millisecond, lateAnswer: time.Second, lateAfter: 2500 * time.Millisecond})
 	cfg := testConfig(srv.URL)
-	cfg.confirmedOnly = true
+	cfg.test = &testHooks{confirmedOnly: true}
 	res, _ := measure(t, cfg, upload)
 	if res.Seconds > 5.3 {
 		t.Errorf("measured over %.2f s, want the 5 s window and one confirmation", res.Seconds)
@@ -521,7 +522,7 @@ func TestRejects(t *testing.T) {
 			t.Parallel()
 			_, srv := newService(t, tc.svc)
 			cfg := testConfig(srv.URL)
-			cfg.confirmedOnly = tc.confirmedOnly
+			cfg.test = &testHooks{confirmedOnly: tc.confirmedOnly}
 			_, err := run(t.Context(), cfg, tc.dir, nil)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("err = %v, want it to mention %q", err, tc.want)
@@ -536,7 +537,7 @@ func TestConfirmedCountDropsOnlyAReplacedConnectionsUnconfirmedUpload(t *testing
 	// the one its replacement leaves unconfirmed may go uncounted.
 	e, srv := newService(t, &service{closeOnce: true, readDelay: 15 * time.Millisecond})
 	cfg := testConfig(srv.URL)
-	cfg.confirmedOnly = true
+	cfg.test = &testHooks{confirmedOnly: true}
 	res, _ := measure(t, cfg, upload)
 	e.mu.Lock()
 	served, dropped := e.measured, e.dropped
@@ -598,6 +599,43 @@ func TestSlowHandshakesWithinWarmUpStillConnect(t *testing.T) {
 	cfg.tls = slow.Client().Transport.(*http.Transport).TLSClientConfig
 	if _, err := run(t.Context(), cfg, download, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestASlowConnectWithinWarmUpStillConnects(t *testing.T) {
+	t.Parallel()
+	// Every TCP connect takes 3.5 s, as on a lossy link that retransmits
+	// its SYN: within warm-up, so the test runs.
+	_, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond})
+	cfg := testConfig(srv.URL)
+	cfg.test = &testHooks{dialControl: func(string, string, syscall.RawConn) error {
+		time.Sleep(3500 * time.Millisecond)
+		return nil
+	}}
+	if _, err := run(t.Context(), cfg, download, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWarmUpThatRunsOutSaysSo(t *testing.T) {
+	t.Parallel()
+	// The service answers nothing within warm-up.
+	_, srv := newService(t, &service{latency: 2 * time.Second})
+	cfg := testConfig(srv.URL)
+	cfg.warmup = time.Second
+	if _, err := run(t.Context(), cfg, download, nil); !errors.Is(err, errConnectTimeout) {
+		t.Fatalf("got %v, want %v", err, errConnectTimeout)
+	}
+}
+
+func TestACancelledWarmUpIsNotATimeout(t *testing.T) {
+	t.Parallel()
+	_, srv := newService(t, &service{latency: 2 * time.Second})
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	_, err := run(ctx, testConfig(srv.URL), download, nil)
+	if errors.Is(err, errConnectTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want the caller's own deadline", err)
 	}
 }
 
