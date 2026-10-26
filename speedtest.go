@@ -117,6 +117,9 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 				return
 			}
 			at, err := w.measure(ctx, started, cfg)
+			if err != nil {
+				at = time.Now()
+			}
 			done <- end{at, err}
 		}()
 	}
@@ -166,65 +169,106 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	socket.start()
 	close(gate)
 
-	// The kernel count is read when the window closes, on its own clock: a
-	// progress callback that holds up this loop cannot let later
-	// acknowledgements in.
-	windowCount := make(chan result, 1)
+	windowClose := started.Add(cfg.window)
+
+	// The kernel count is read when the window closes, on its own clock.
+	type count struct {
+		bytes int64
+		ok    bool
+	}
+	windowCount := make(chan count, 1)
 	if socket != nil {
 		windowEnd := time.AfterFunc(cfg.window, func() {
-			if n, ok := socket.delivered(); ok {
-				windowCount <- result{Bytes: n, Seconds: cfg.window.Seconds(), Mbps: mbps(n, cfg.window), Connections: cfg.connections}
-			}
+			n, ok := socket.delivered()
+			windowCount <- count{n, ok}
 		})
 		defer windowEnd.Stop()
 	}
+	kernel := func(c count) (result, error) {
+		if tooSlow() {
+			return result{}, errTooSlow
+		}
+		return result{Bytes: c.bytes, Seconds: cfg.window.Seconds(), Mbps: mbps(c.bytes, cfg.window), Connections: cfg.connections}, nil
+	}
+
+	// The progress callback runs on its own goroutine with the latest rate,
+	// so a reader that falls behind cannot hold up this loop. It has
+	// returned before run does.
+	rates := make(chan float64, 1)
+	reported := make(chan struct{})
+	go func() {
+		defer close(reported)
+		for rate := range rates {
+			if progress != nil {
+				progress(rate)
+			}
+		}
+	}()
+	defer func() {
+		close(rates)
+		<-reported
+	}()
 
 	limit := time.NewTimer(cfg.window + cfg.drain + time.Second)
 	defer limit.Stop()
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	ended := started
+	var closed *count
+	var cut error // a transfer cut off after the window closed
 	for finished := 0; finished < cfg.connections; {
 		select {
-		case res := <-windowCount:
-			if tooSlow() {
-				return result{}, errTooSlow
+		case c := <-windowCount:
+			if c.ok {
+				return kernel(c)
 			}
-			return res, nil
+			closed = &c
 		case e := <-done:
-			if e.err != nil {
-				// A transfer cut off after the window closed does not
-				// change what was counted in it.
-				select {
-				case res := <-windowCount:
-					if !tooSlow() {
-						return res, nil
-					}
-				default:
-				}
-				return result{}, e.err
-			}
 			finished++
+			if e.err != nil {
+				if socket == nil || e.at.Before(windowClose) {
+					return result{}, e.err
+				}
+				cut = e.err
+				continue
+			}
 			if e.at.After(ended) {
 				ended = e.at
 			}
 		case <-tick.C:
-			if progress != nil {
-				progress(mbps(total(), time.Since(started)))
+			select {
+			case <-rates:
+			default:
 			}
+			rates <- mbps(total(), time.Since(started))
 		case <-limit.C:
 			return result{}, errors.New("speed test timed out")
 		}
 	}
 
-	// Every worker stopped before the window closed. A kernel count still
-	// holds, over the time the run took.
-	if n, ok := socket.delivered(); ok {
-		if tooSlow() {
-			return result{}, errTooSlow
+	if socket != nil {
+		if cut != nil || !ended.Before(windowClose) {
+			// The window closed before the last worker finished, so its
+			// own count is the result.
+			if closed == nil {
+				c := <-windowCount
+				closed = &c
+			}
+			if closed.ok {
+				return kernel(*closed)
+			}
+			if cut != nil {
+				return result{}, cut
+			}
+		} else if n, ok := socket.delivered(); ok {
+			// Every worker stopped before the window closed. The kernel
+			// count holds, over the time the run took.
+			if tooSlow() {
+				return result{}, errTooSlow
+			}
+			elapsed := ended.Sub(started)
+			return result{Bytes: n, Seconds: elapsed.Seconds(), Mbps: mbps(n, elapsed), Connections: cfg.connections}, nil
 		}
-		elapsed := ended.Sub(started)
-		return result{Bytes: n, Seconds: elapsed.Seconds(), Mbps: mbps(n, elapsed), Connections: cfg.connections}, nil
 	}
 
 	bytes := confirmed()

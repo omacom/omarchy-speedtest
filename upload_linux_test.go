@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -171,14 +172,10 @@ func bytesReceived(t *testing.T, conn net.Conn) uint64 {
 	return n
 }
 
-func TestABlockedProgressCannotAddBytesAfterTheWindow(t *testing.T) {
-	t.Parallel()
-	// The panel stops reading for three seconds just before the window
-	// closes, while uploads are still in flight because the link slowed.
-	// The count is taken when the window closes, not when the main loop
-	// gets round to it: it matches what the server's TCP received in the
-	// window.
-	e, srv := newService(t, &service{readDelay: 15 * time.Millisecond, slowAfter: 4500 * time.Millisecond, slowReadDelay: 400 * time.Millisecond})
+// receivedInWindow reports what the service's TCP received in the five
+// seconds from the first measured upload.
+func receivedInWindow(t *testing.T, e *service) <-chan uint64 {
+	t.Helper()
 	received := func() (n uint64) {
 		e.mu.Lock()
 		defer e.mu.Unlock()
@@ -206,17 +203,35 @@ func TestABlockedProgressCannotAddBytesAfterTheWindow(t *testing.T) {
 			time.Sleep(100 * time.Microsecond)
 		}
 	}()
-	// The first update comes 250 ms into the window; block at 4.75 s.
+	return window
+}
+
+// blockOnce returns a progress callback that stops reading for hold, once,
+// after its first update plus after.
+func blockOnce(after, hold time.Duration) (func(float64), *atomic.Bool) {
 	var blocked atomic.Bool
 	var first time.Time
-	progress := func(float64) {
+	return func(float64) {
 		if first.IsZero() {
 			first = time.Now()
 		}
-		if time.Since(first) >= 4500*time.Millisecond && blocked.CompareAndSwap(false, true) {
-			time.Sleep(3 * time.Second)
+		if time.Since(first) >= after && blocked.CompareAndSwap(false, true) {
+			time.Sleep(hold)
 		}
-	}
+	}, &blocked
+}
+
+func TestABlockedProgressCannotAddBytesAfterTheWindow(t *testing.T) {
+	t.Parallel()
+	// The panel stops reading for three seconds just before the window
+	// closes, while uploads are still in flight because the link slowed.
+	// The count is taken when the window closes, not when the main loop
+	// gets round to it: it matches what the server's TCP received in the
+	// window.
+	e, srv := newService(t, &service{readDelay: 15 * time.Millisecond, slowAfter: 4500 * time.Millisecond, slowReadDelay: 400 * time.Millisecond})
+	window := receivedInWindow(t, e)
+	// The first update comes 250 ms into the window; block on the 4.75 s one.
+	progress, blocked := blockOnce(4400*time.Millisecond, 3*time.Second)
 	res, err := run(t.Context(), testConfig(srv.URL), upload, progress)
 	if err != nil {
 		t.Fatal(err)
@@ -227,5 +242,39 @@ func TestABlockedProgressCannotAddBytesAfterTheWindow(t *testing.T) {
 	}
 	if float64(res.Bytes) > 1.02*inWindow || float64(res.Bytes) < 0.98*inWindow {
 		t.Errorf("counted %d bytes, the server's TCP received %.0f in the window", res.Bytes, inWindow)
+	}
+}
+
+func TestAWorkerThatEndsAfterTheWindowKeepsTheWindowsCount(t *testing.T) {
+	t.Parallel()
+	// One connection whose last upload ends after the window closes, while
+	// the panel is not reading. The worker's end must not reopen the count.
+	e, srv := newService(t, &service{readDelay: 15 * time.Millisecond, slowAfter: 4500 * time.Millisecond, slowReadDelay: 400 * time.Millisecond})
+	window := receivedInWindow(t, e)
+	cfg := testConfig(srv.URL)
+	cfg.connections = 1
+	progress, _ := blockOnce(4400*time.Millisecond, 3*time.Second)
+	res, err := run(t.Context(), cfg, upload, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inWindow := float64(<-window)
+	if res.Seconds != cfg.window.Seconds() {
+		t.Errorf("divided by %.2f s, the window is %.0f s", res.Seconds, cfg.window.Seconds())
+	}
+	if float64(res.Bytes) > 1.02*inWindow || float64(res.Bytes) < 0.98*inWindow {
+		t.Errorf("counted %d bytes, the server's TCP received %.0f in the window", res.Bytes, inWindow)
+	}
+}
+
+func TestAFailureBeforeTheWindowClosesStillFails(t *testing.T) {
+	t.Parallel()
+	// The service misreports the first upload, and the panel does not read
+	// again until after the window has closed. The failure stands.
+	_, srv := newService(t, &service{badAck: true, badAckAfter: 500 * time.Millisecond})
+	progress, _ := blockOnce(0, 6*time.Second)
+	_, err := run(t.Context(), testConfig(srv.URL), upload, progress)
+	if err == nil || !strings.Contains(err.Error(), "acknowledge") {
+		t.Fatalf("got %v, want the acknowledgement error", err)
 	}
 }

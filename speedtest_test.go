@@ -20,17 +20,18 @@ import (
 // served in the measured phase so a test can compare the client's result
 // with the server's own count.
 type service struct {
-	latency    time.Duration // before every response
-	chunk      int           // download write size
-	chunkDelay time.Duration // after every download write
-	readDelay  time.Duration // after every 64 KiB of upload read
-	upRate     float64       // upload bytes per second per connection, if set
-	truncate   bool          // send half of every measured download
-	badAck     bool          // acknowledge one byte less than a measured upload
-	closeAfter bool          // close the connection after measured uploads
-	closeOnce  bool          // close one connection after its third measured upload
-	shortBody  bool          // honestly send half of every measured download
-	earlyAck   bool          // acknowledge measured uploads before reading them, then close
+	latency     time.Duration // before every response
+	chunk       int           // download write size
+	chunkDelay  time.Duration // after every download write
+	readDelay   time.Duration // after every 64 KiB of upload read
+	upRate      float64       // upload bytes per second per connection, if set
+	truncate    bool          // send half of every measured download
+	badAck      bool          // acknowledge one byte less than a measured upload
+	badAckAfter time.Duration // from this long into the measurement
+	closeAfter  bool          // close the connection after measured uploads
+	closeOnce   bool          // close one connection after its third measured upload
+	shortBody   bool          // honestly send half of every measured download
+	earlyAck    bool          // acknowledge measured uploads before reading them, then close
 	// Hold back the first byte of every measured download, like a slow first
 	// byte or a TCP ramp at the start of the window.
 	firstByteDelay time.Duration
@@ -225,7 +226,11 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			e.mark(got)
 		}
 		if e.badAck && measured {
-			got--
+			e.mu.Lock()
+			if time.Since(e.first) >= e.badAckAfter {
+				got--
+			}
+			e.mu.Unlock()
 		}
 		replace := false
 		if measured && e.closeOnce {

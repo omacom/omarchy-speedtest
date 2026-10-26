@@ -37,8 +37,9 @@ It exits 0 with a result, 1 when the test fails and 2 for a usage error.
 - Uploads, on Linux, count what the server's TCP acknowledged during the
   window: `tcpi_bytes_acked` from `TCP_INFO`, read for every connection as
   the window opens and as it closes, and as a connection closes in between.
-  The closing read runs on the window's own timer, so a progress reader
-  that falls behind cannot let later acknowledgements in.
+  The closing read runs on the window's own timer, and progress is
+  reported from its own goroutine, so a reader that falls behind cannot
+  change the result.
   TLS record framing is taken off; the request lines, about 200 bytes per
   upload, stay in. The result divides by the window, so a slow last answer
   from the server cannot stretch the clock.
