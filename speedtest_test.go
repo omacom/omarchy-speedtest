@@ -34,6 +34,10 @@ type service struct {
 	// Hold back the first byte of every measured download, like a slow first
 	// byte or a TCP ramp at the start of the window.
 	firstByteDelay time.Duration
+	// One bottleneck for every measured download, in bytes per second, and
+	// a first byte held back a second on every other connection.
+	sharedRate       float64
+	staggerFirstByte bool
 	// Answer measured uploads that arrive lateAfter or later into the
 	// measurement only after lateAnswer: the slow last answer that used to
 	// stretch the upload clock.
@@ -51,6 +55,8 @@ type service struct {
 	dropped         int64 // the upload whose connection closeOnce closed
 
 	closed   atomic.Bool
+	paceNext time.Time      // when the shared bottleneck is next free
+	seen     map[string]int // measured download requests per connection
 	requests atomic.Int64
 	http2    atomic.Int64 // requests that did not use HTTP/1.1
 	noise    atomic.Int64 // bytes served to unrelated traffic
@@ -116,7 +122,19 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if measured {
 			e.mark(0)
-			time.Sleep(e.firstByteDelay)
+			delay := e.firstByteDelay
+			if e.staggerFirstByte {
+				e.mu.Lock()
+				if e.seen == nil {
+					e.seen = map[string]int{}
+				}
+				if e.seen[r.RemoteAddr] == 0 && len(e.seen)%2 == 1 {
+					delay = time.Second
+				}
+				e.seen[r.RemoteAddr]++
+				e.mu.Unlock()
+			}
+			time.Sleep(delay)
 		}
 		truncate, short := e.truncate && measured, e.shortBody && measured
 		limit := size
@@ -129,6 +147,7 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		e.serve(w, limit, e.chunk, e.chunkDelay, func(n int64) {
 			if measured {
+				e.pace(n)
 				e.mark(n)
 			}
 		})
@@ -210,6 +229,22 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// pace holds a write until the shared bottleneck has room for it.
+func (e *service) pace(n int64) {
+	if e.sharedRate == 0 {
+		return
+	}
+	e.mu.Lock()
+	now := time.Now()
+	if e.paceNext.Before(now) {
+		e.paceNext = now
+	}
+	at := e.paceNext
+	e.paceNext = e.paceNext.Add(time.Duration(float64(n) / e.sharedRate * float64(time.Second)))
+	e.mu.Unlock()
+	time.Sleep(time.Until(at))
 }
 
 func (e *service) serve(w http.ResponseWriter, size int64, chunk int, delay time.Duration, sent func(int64)) {
@@ -316,8 +351,8 @@ func TestCountsOnlyTestPayloads(t *testing.T) {
 
 func TestASlowFirstByteDoesNotShortenTheDownloadWindow(t *testing.T) {
 	t.Parallel()
-	// Every connection's window opens at its first measured byte, so a
-	// second without bytes at the start is not counted against the link.
+	// The window opens at the first measured byte, so a second without
+	// bytes at the start is not counted against the link.
 	e, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond, firstByteDelay: time.Second})
 	res, _ := measure(t, testConfig(srv.URL), download)
 	e.mu.Lock()
@@ -325,6 +360,19 @@ func TestASlowFirstByteDoesNotShortenTheDownloadWindow(t *testing.T) {
 	e.mu.Unlock()
 	if res.Mbps < 0.95*want || res.Mbps > 1.05*want {
 		t.Errorf("rate %.1f Mbps, server sent %.1f Mbps once it started", res.Mbps, want)
+	}
+}
+
+func TestStaggeredConnectionsCannotExceedTheLink(t *testing.T) {
+	t.Parallel()
+	// Eight connections share one 240 Mbit/s bottleneck, and half of them
+	// see their first byte a second late. Bytes over a window must never
+	// exceed what the bottleneck carries in that window.
+	const rate = 30e6
+	_, srv := newService(t, &service{sharedRate: rate, staggerFirstByte: true})
+	res, _ := measure(t, testConfig(srv.URL), download)
+	if limit := rate * 8 / 1e6; res.Mbps > 1.05*limit || res.Mbps < 0.85*limit {
+		t.Errorf("rate %.1f Mbps through a %.0f Mbit/s bottleneck", res.Mbps, limit)
 	}
 }
 
@@ -504,7 +552,8 @@ func TestResultJSON(t *testing.T) {
 
 func TestBytesAfterTheWindowAreNotCounted(t *testing.T) {
 	w := newWorker(testConfig("http://127.0.0.1:1"), download)
-	w.windowEnd = time.Now().Add(-time.Millisecond)
+	w.win = newDownloadWindow(time.Second)
+	w.win.closesAt(time.Now().Add(-2 * time.Second))
 	err := w.receive(bytes.NewReader(make([]byte, 64<<10)), 64<<10, true)
 	if err == nil || w.bytes.Load() != 0 {
 		t.Errorf("err = %v, counted %d bytes after the window", err, w.bytes.Load())

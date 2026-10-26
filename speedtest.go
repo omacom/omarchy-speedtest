@@ -95,9 +95,11 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	gate := make(chan struct{})
 	var started time.Time
 
+	win := newDownloadWindow(cfg.window)
 	warmupEnd := time.Now().Add(cfg.warmup)
 	for i := range workers {
 		w := newWorker(cfg, dir)
+		w.win = win
 		workers[i] = w
 		go func() {
 			defer w.client.CloseIdleConnections()
@@ -200,8 +202,8 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		return result{}, errors.New("the connection is too slow to finish an upload in the test window")
 	}
 
-	// Every download connection measured for exactly one window, from its
-	// own first byte. Uploads end when the server confirms the last byte.
+	// Downloads count in one window from the first measured byte. Uploads
+	// end when the server confirms the last byte.
 	elapsed := ended.Sub(started)
 	if dir == download {
 		elapsed = cfg.window
@@ -237,11 +239,7 @@ type worker struct {
 	warmSize int64
 	warmTime time.Duration
 
-	// A download connection's window opens at its first measured byte, so
-	// the time to that byte is not counted against the link.
-	window      time.Duration
-	windowEnd   time.Time          // zero until the first measured byte
-	closeWindow context.CancelFunc // cuts the request in flight at windowEnd
+	win *downloadWindow // shared by every download worker of a run
 
 	// Upload accounting from the kernel: the current connection, and what
 	// connections closed since the window opened had acknowledged.
@@ -253,6 +251,55 @@ type worker struct {
 
 // errWindowClosed ends a download whose window closed mid-request.
 var errWindowClosed = errors.New("measurement window closed")
+
+// downloadWindow is the one window every download connection counts in. It
+// opens at the first measured byte on any connection, so the wait for that
+// byte is not counted against the link, and like any single window it holds
+// no more than the link carried in it, however late a connection starts.
+type downloadWindow struct {
+	length time.Duration
+	mu     sync.Mutex
+	end    time.Time            // zero until the first measured byte
+	cuts   []context.CancelFunc // the requests to cut when it closes
+}
+
+func newDownloadWindow(length time.Duration) *downloadWindow {
+	return &downloadWindow{length: length}
+}
+
+// register adds a worker's request context to be cut when the window closes.
+func (d *downloadWindow) register(cut context.CancelFunc) {
+	d.mu.Lock()
+	d.cuts = append(d.cuts, cut)
+	d.mu.Unlock()
+}
+
+// closesAt opens the window at now if it is not open yet and returns its end.
+func (d *downloadWindow) closesAt(now time.Time) time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.end.IsZero() {
+		d.end = now.Add(d.length)
+		time.AfterFunc(d.length, d.cutAll)
+	}
+	return d.end
+}
+
+// open reports whether the window has not closed yet.
+func (d *downloadWindow) open() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.end.IsZero() || time.Now().Before(d.end)
+}
+
+func (d *downloadWindow) cutAll() {
+	d.mu.Lock()
+	cuts := d.cuts
+	d.mu.Unlock()
+	for _, cut := range cuts {
+		cut()
+	}
+}
 
 func newWorker(cfg config, dir mode) *worker {
 	var protocols http.Protocols
@@ -342,23 +389,21 @@ func (w *worker) warm(ctx context.Context, deadline time.Time) error {
 func (w *worker) measure(ctx context.Context, started time.Time, cfg config) (time.Time, error) {
 	windowEnd := started.Add(cfg.window)
 	if w.dir == download {
-		// Long streams keep the link busy. The window opens at the first
-		// measured byte (receive), and the request in flight when it closes
-		// is cut. A first byte later than the drain allowance is cut short
-		// with the rest, at the limit.
+		// Long streams keep the link busy. The shared window opens at the
+		// first measured byte on any connection (receive), and the requests
+		// in flight when it closes are cut.
 		ctx, cancel := context.WithDeadline(ctx, windowEnd.Add(cfg.drain))
 		defer cancel()
-		w.window, w.closeWindow = cfg.window, cancel
-		open := func() bool { return w.windowEnd.IsZero() || time.Now().Before(w.windowEnd) }
-		for open() {
+		w.win.register(cancel)
+		for w.win.open() {
 			if _, err := w.do(ctx, download, downloadSizes[len(downloadSizes)-1], true); err != nil {
-				if open() {
+				if w.win.open() {
 					return time.Time{}, err
 				}
 				break
 			}
 		}
-		return w.windowEnd, nil
+		return time.Now(), nil
 	}
 
 	ctx, cancel := context.WithDeadline(ctx, windowEnd.Add(cfg.drain))
@@ -465,18 +510,15 @@ func (w *worker) do(ctx context.Context, m mode, size int64, measured bool) (tim
 	return time.Since(begin), err
 }
 
-// receive reads a download. Its first measured byte opens the worker's
-// window, and bytes that arrive after the window are never counted.
+// receive reads a download. The first measured byte of the run opens the
+// shared window, and bytes that arrive after it closes are never counted.
 func (w *worker) receive(body io.Reader, size int64, measured bool) error {
 	var got int64
 	for {
 		n, err := body.Read(w.buf)
 		if n > 0 {
 			if measured {
-				now := time.Now()
-				if w.windowEnd.IsZero() {
-					w.openWindow(now)
-				} else if !now.Before(w.windowEnd) {
+				if now := time.Now(); !now.Before(w.win.closesAt(now)) {
 					return errWindowClosed
 				}
 				w.bytes.Add(int64(n))
@@ -494,13 +536,6 @@ func (w *worker) receive(body io.Reader, size int64, measured bool) error {
 		return errors.New("incomplete test download")
 	}
 	return nil
-}
-
-func (w *worker) openWindow(now time.Time) {
-	w.windowEnd = now.Add(w.window)
-	if w.closeWindow != nil {
-		time.AfterFunc(w.window, w.closeWindow)
-	}
 }
 
 // acknowledge checks the server accepted the whole upload and holds a

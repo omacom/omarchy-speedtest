@@ -27,10 +27,11 @@ It exits 0 with a result, 1 when the test fails and 2 for a usage error.
   connection measures its request latency and grows its payload until a
   request takes 250 ms, then the five-second window starts.
 - Only payload counts, never other traffic on the machine.
-- Downloads count body bytes as they arrive. Each connection's window opens
-  at its own first measured byte, so the time to that byte and the start of
-  its TCP ramp do not count against the link, and the request in flight
-  when the window closes is cut. The result divides by the window.
+- Downloads count body bytes as they arrive, in one window that opens at
+  the first measured byte on any connection, so the wait for that byte does
+  not count against the link. The requests in flight when it closes are
+  cut. The result divides by the window, and one window can hold no more
+  than the link carried in it, however late a connection starts.
 - Uploads, on Linux, count what the server's TCP acknowledged during the
   window: `tcpi_bytes_acked` from `TCP_INFO`, read for every connection as
   the window opens and as it closes, and as a connection closes in between.

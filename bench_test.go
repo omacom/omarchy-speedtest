@@ -33,7 +33,7 @@ func BenchmarkReceive(b *testing.B) {
 	for _, record := range []int64{1 << 10, 16 << 10} {
 		b.Run("record="+strconv.FormatInt(record>>10, 10)+"KiB", func(b *testing.B) {
 			w := newWorker(testConfig("http://127.0.0.1:1"), download)
-			w.window = time.Hour
+			w.win = newDownloadWindow(time.Hour)
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
