@@ -2,6 +2,7 @@
 // Omarchy's speed test service.
 //
 //	omarchy-speedtest down|up [--json]
+//	omarchy-speedtest --version
 //
 // Without --json it prints the running rate in Mbps about four times a
 // second and the final rate last, one number per line. With --json it
@@ -49,7 +50,14 @@ func parentAlive() bool {
 	return parent != 1 && os.Getppid() == expected
 }
 
+// version is set at build time: -ldflags "-X main.version=1.2.3".
+var version = "dev"
+
 func cli(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 && args[0] == "--version" {
+		fmt.Fprintln(stdout, "omarchy-speedtest", version)
+		return 0
+	}
 	var dir mode
 	var ok bool
 	if len(args) > 0 {
@@ -57,7 +65,7 @@ func cli(args []string, stdout, stderr io.Writer) int {
 	}
 	asJSON := len(args) == 2 && args[1] == "--json"
 	if !ok || len(args) > 2 || len(args) == 2 && !asJSON {
-		fmt.Fprintln(stderr, "Usage: omarchy-speedtest down|up [--json]")
+		fmt.Fprintln(stderr, "Usage: omarchy-speedtest down|up [--json] | --version")
 		return 2
 	}
 

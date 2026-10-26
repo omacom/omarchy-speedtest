@@ -54,6 +54,14 @@ func TestCommandUsage(t *testing.T) {
 	}
 }
 
+func TestCommandVersion(t *testing.T) {
+	t.Parallel()
+	out, err := command(t, "http://127.0.0.1:1", "--version").Output()
+	if err != nil || string(out) != "omarchy-speedtest dev\n" {
+		t.Errorf("err = %v, output %q", err, out)
+	}
+}
+
 func TestCommandRejectsBadEnvironment(t *testing.T) {
 	t.Parallel()
 	for _, env := range []string{"OMARCHY_SPEEDTEST_CONNECTIONS=0", "OMARCHY_SPEEDTEST_CONNECTIONS=17", "OMARCHY_SPEEDTEST_URL=ftp://x"} {
