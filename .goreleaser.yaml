@@ -42,7 +42,10 @@ signs:
 
 changelog:
   use: github
-  sort: asc
+  # Name authors by GitHub handle only. The default falls back to name and
+  # email when GitHub returns no login, as for a repository's first tag.
+  format: "{{ .SHA }}: {{ .Message }}{{ if .Logins }} ({{ .Logins | englishJoin }}){{ end }}"
+  abbrev: 7
   filters:
     exclude: ["^Merge "]
 
