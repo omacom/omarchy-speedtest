@@ -24,7 +24,8 @@ It exits 0 with a result, 1 when the test fails and 2 for a usage error.
   every worker on its own TCP connection, with no HTTP/2 flow-control
   window between the payload and the link.
 - Connecting (DNS, TCP, TLS) and warm-up stay outside the measurement. Each
-  connection measures its request latency within warm-up's six seconds. Upload
+  connection measures its request latency within warm-up's six seconds, with
+  no shorter timeout of its own, so slow handshakes still connect. Upload
   connections also grow their payload until a request takes 250 ms, then the
   five-second window starts. Download connections skip that: they stream
   the largest payload until the window closes, and warm-up transfers would

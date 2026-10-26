@@ -558,6 +558,49 @@ func TestRunLeavesNoConnectionsOpen(t *testing.T) {
 	}
 }
 
+// slowHandshakes holds each connection's first write, the server's TLS
+// handshake flight, for delay.
+type slowHandshakes struct {
+	net.Listener
+	delay time.Duration
+}
+
+func (l *slowHandshakes) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &slowHandshakeConn{Conn: c, delay: l.delay}, nil
+}
+
+type slowHandshakeConn struct {
+	net.Conn
+	delay time.Duration
+	once  sync.Once
+}
+
+func (c *slowHandshakeConn) Write(b []byte) (int, error) {
+	c.once.Do(func() { time.Sleep(c.delay) })
+	return c.Conn.Write(b)
+}
+
+func TestSlowHandshakesWithinWarmUpStillConnect(t *testing.T) {
+	t.Parallel()
+	// Every TLS handshake takes 3.5 s, as on a satellite link with a queue:
+	// longer than any few-second cap, within warm-up. Connecting has
+	// warm-up's budget, not a deadline of its own.
+	e := &service{chunk: 64 << 10, chunkDelay: 15 * time.Millisecond}
+	slow := httptest.NewUnstartedServer(e)
+	slow.Listener = &slowHandshakes{Listener: slow.Listener, delay: 3500 * time.Millisecond}
+	slow.StartTLS()
+	t.Cleanup(slow.Close)
+	cfg := testConfig(slow.URL)
+	cfg.tls = slow.Client().Transport.(*http.Transport).TLSClientConfig
+	if _, err := run(t.Context(), cfg, download, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNegotiatesHTTP1WithHTTP2Servers(t *testing.T) {
 	t.Parallel()
 	e := &service{chunk: 64 << 10, chunkDelay: 15 * time.Millisecond}

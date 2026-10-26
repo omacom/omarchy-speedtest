@@ -424,10 +424,12 @@ func (d *downloadWindow) cutAll() {
 func newWorker(cfg config, dir mode) *worker {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
+	// Connecting has no timeout of its own: every request carries the
+	// warm-up's or the window's deadline, and on a slow link eight parallel
+	// handshakes share it.
 	transport := &http.Transport{
 		Proxy:               cfg.proxy,
 		TLSClientConfig:     cfg.tls,
-		TLSHandshakeTimeout: 3 * time.Second,
 		MaxConnsPerHost:     1,
 		MaxIdleConnsPerHost: 1,
 		DisableCompression:  true,
@@ -451,7 +453,7 @@ func newWorker(cfg config, dir mode) *worker {
 	if dir == upload {
 		w.sizes = uploadSizes
 	}
-	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	var dialer net.Dialer
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		conn, err := dialer.DialContext(ctx, network, address)
 		tcp, ok := conn.(*net.TCPConn)
