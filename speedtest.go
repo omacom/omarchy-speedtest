@@ -261,10 +261,12 @@ type worker struct {
 
 	win *downloadWindow // shared by every download worker of a run
 
-	// Upload accounting from the kernel: the current connection, and what
-	// connections closed since the window opened had acknowledged.
+	// Upload accounting from the kernel: the open connections, and what
+	// connections closed since the window opened had acknowledged. Go's
+	// transport can dial a replacement before it closes the old connection,
+	// so more than one can be open.
 	socketMu sync.Mutex
-	conn     *countedConn
+	conns    []*countedConn
 	counting bool
 	retired  uint64
 }
@@ -357,11 +359,7 @@ func newWorker(cfg config, dir mode) *worker {
 		if err != nil || !ok {
 			return conn, err
 		}
-		counted := &countedConn{TCPConn: tcp, w: w}
-		w.socketMu.Lock()
-		w.conn = counted
-		w.socketMu.Unlock()
-		return counted, nil
+		return w.track(tcp), nil
 	}
 	w.trace.GotConn = func(info httptrace.GotConnInfo) { w.reused.Store(info.Reused) }
 	return w
@@ -597,22 +595,34 @@ func (z *zeros) Read(p []byte) (int, error) {
 
 // countedConn records, as it closes, what the server acknowledged on it,
 // so a connection replaced mid-window loses none of its count.
+// A connection dialled after the window opened starts from zero, so its
+// TLS handshake, about 2 KB, counts as upload: under 0.001% of a gigabit
+// window per replacement.
 type countedConn struct {
 	*net.TCPConn
 	w    *worker
 	base uint64 // acknowledged before the window opened
-	gone bool
+}
+
+// track adds tcp to the worker's counted connections.
+func (w *worker) track(tcp *net.TCPConn) *countedConn {
+	counted := &countedConn{TCPConn: tcp, w: w}
+	w.socketMu.Lock()
+	w.conns = append(w.conns, counted)
+	w.socketMu.Unlock()
+	return counted
 }
 
 func (c *countedConn) Close() error {
-	c.w.socketMu.Lock()
-	if c.w.counting && !c.gone {
-		if acked, ok := bytesAcked(c.TCPConn); ok {
-			c.w.retired += acked - c.base
+	w := c.w
+	w.socketMu.Lock()
+	if i := slices.Index(w.conns, c); i >= 0 {
+		if acked, ok := bytesAcked(c.TCPConn); ok && w.counting {
+			w.retired += acked - c.base
 		}
+		w.conns = slices.Delete(w.conns, i, i+1)
 	}
-	c.gone = true
-	c.w.socketMu.Unlock()
+	w.socketMu.Unlock()
 	return c.TCPConn.Close()
 }
 
@@ -635,12 +645,13 @@ func (s *socketCount) start() {
 	s.ok = true
 	for _, w := range s.workers {
 		w.socketMu.Lock()
-		if w.conn == nil {
+		if len(w.conns) == 0 {
 			s.ok = false
-		} else if acked, ok := bytesAcked(w.conn.TCPConn); ok {
-			w.conn.base = acked
-		} else {
-			s.ok = false
+		}
+		for _, c := range w.conns {
+			acked, ok := bytesAcked(c.TCPConn)
+			c.base = acked
+			s.ok = s.ok && ok
 		}
 		w.counting, w.retired = true, 0
 		w.socketMu.Unlock()
@@ -661,7 +672,7 @@ func (s *socketCount) delivered() (int64, bool) {
 	for _, w := range s.workers {
 		w.socketMu.Lock()
 		n += w.retired
-		if c := w.conn; c != nil && !c.gone {
+		for _, c := range w.conns {
 			acked, ok := bytesAcked(c.TCPConn)
 			if !ok {
 				w.socketMu.Unlock()
