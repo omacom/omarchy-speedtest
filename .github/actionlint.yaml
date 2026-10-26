@@ -1,0 +1,6 @@
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      # GitHub's self-repository syntax (uses: $/...), July 2026, is newer
+      # than actionlint's parser. Drop this once actionlint accepts it.
+      - 'reusable workflow call "\$/\.github/workflows/ci\.yml"'

@@ -1,0 +1,26 @@
+version: 2
+
+# New releases wait out a cooldown before Dependabot proposes them, so a
+# compromised release is usually caught and pulled first. Security updates
+# are exempt and arrive at once.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directories: [/, /tools]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+    groups:
+      go-tools:
+        patterns: ["*"]
