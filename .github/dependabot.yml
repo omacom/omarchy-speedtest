@@ -17,15 +17,23 @@ updates:
         patterns: ["*"]
 
   # The client's own module has no dependencies; the tools module does.
-  # Go records a `tool` directive's modules as `// indirect`, and Dependabot
-  # updates only direct dependencies unless told otherwise
+  # Only the tools are bumped, and `go get` raises their requirements to
+  # what each release asks for: bumping a tool's dependencies past that can
+  # break its build (yaml/v4 rc.6 does not compile with actionlint 1.7.12).
+  # Go records a `tool` directive's module as `// indirect`, and an allow
+  # rule's type defaults to direct, so each rule says `all`
   # (dependabot/dependabot-core#12050).
   - package-ecosystem: gomod
     directory: /tools
     schedule:
       interval: monthly
     allow:
-      - dependency-type: all
+      - dependency-name: github.com/rhysd/actionlint
+        dependency-type: all
+      - dependency-name: golang.org/x/perf
+        dependency-type: all
+      - dependency-name: golang.org/x/vuln
+        dependency-type: all
     cooldown:
       default-days: 7
     groups:
