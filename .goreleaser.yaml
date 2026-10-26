@@ -48,6 +48,10 @@ changelog:
 
 release:
   name_template: "omarchy-speedtest {{ .Version }}"
+  # Stop before building when the token cannot publish, or when this tag is
+  # already an immutable release.
+  preflight:
+    fail_on_error: true
   footer: |
     ## Verify
 
