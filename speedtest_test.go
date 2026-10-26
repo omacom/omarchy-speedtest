@@ -355,6 +355,21 @@ func TestVerySlowUplinksStillMeasure(t *testing.T) {
 	}
 }
 
+func TestConfirmedUploadsStopWhenAnswersTurnSlow(t *testing.T) {
+	t.Parallel()
+	// From 2.5 s into the window every answer comes a second late. Without
+	// the kernel's count the last answer ends the clock, so the client must
+	// stop starting uploads it cannot have answered inside the window. The
+	// rate estimate, which absorbs the late answers, is what stops it.
+	_, srv := newService(t, &service{readDelay: 15 * time.Millisecond, lateAnswer: time.Second, lateAfter: 2500 * time.Millisecond})
+	cfg := testConfig(srv.URL)
+	cfg.confirmedOnly = true
+	res, _ := measure(t, cfg, upload)
+	if res.Seconds > 5.3 {
+		t.Errorf("measured over %.2f s, want the 5 s window and one confirmation", res.Seconds)
+	}
+}
+
 func TestLatencyDoesNotPinUploadsToSmallRequests(t *testing.T) {
 	t.Parallel()
 	e, srv := newService(t, &service{latency: 50 * time.Millisecond})
