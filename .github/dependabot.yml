@@ -1,8 +1,10 @@
+# Keeps the actions and the Go tools current. Actions are pinned to commit
+# SHAs with the version in a comment; Dependabot bumps both.
+#
+# A week passes between a release and its bump: the window in which a
+# compromised release is usually noticed and pulled. Security updates skip
+# the cooldown and arrive at once, and govulncheck blocks CI meanwhile.
 version: 2
-
-# New releases wait out a cooldown before Dependabot proposes them, so a
-# compromised release is usually caught and pulled first. Security updates
-# are exempt and arrive at once.
 updates:
   - package-ecosystem: github-actions
     directory: /
@@ -14,13 +16,18 @@ updates:
       github-actions:
         patterns: ["*"]
 
+  # The client's own module has no dependencies; the tools module does.
+  # Go records a `tool` directive's modules as `// indirect`, and Dependabot
+  # updates only direct dependencies unless told otherwise
+  # (dependabot/dependabot-core#12050).
   - package-ecosystem: gomod
-    directories: [/, /tools]
+    directory: /tools
     schedule:
-      interval: weekly
+      interval: monthly
+    allow:
+      - dependency-type: all
     cooldown:
-      default-days: 3
-      semver-major-days: 7
+      default-days: 7
     groups:
       go-tools:
         patterns: ["*"]
