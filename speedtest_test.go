@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -38,7 +39,13 @@ type service struct {
 	firstByteDelay time.Duration
 	// One bottleneck for every measured download, in bytes per second, and
 	// a first byte held back a second on every other connection.
-	sharedRate       float64
+	sharedRate float64
+	// The listener's receive buffer, so the server's kernel acknowledges
+	// uploads only as fast as the handler reads them.
+	rcvBuf int
+	// One slow link under every request, warm-up included: body bytes in
+	// either direction, in bytes per second shared by all connections.
+	linkRate         float64
 	staggerFirstByte bool
 	// Answer measured uploads that arrive lateAfter or later into the
 	// measurement only after lateAnswer: the slow last answer that used to
@@ -65,6 +72,7 @@ type service struct {
 
 	closed   atomic.Bool
 	paceNext time.Time      // when the shared bottleneck is next free
+	linkNext time.Time      // when the slow link is next free
 	seen     map[string]int // measured download requests per connection
 	requests atomic.Int64
 	http2    atomic.Int64 // requests that did not use HTTP/1.1
@@ -78,6 +86,23 @@ func newService(t *testing.T, e *service) (*service, *httptest.Server) {
 		e.chunk = 64 << 10
 	}
 	srv := httptest.NewUnstartedServer(e)
+	if e.rcvBuf > 0 {
+		lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+			var err error
+			if cerr := c.Control(func(fd uintptr) {
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, e.rcvBuf)
+			}); cerr != nil {
+				return cerr
+			}
+			return err
+		}}
+		ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = srv.Listener.Close()
+		srv.Listener = ln
+	}
 	srv.Config.ConnState = func(c net.Conn, state http.ConnState) {
 		switch state {
 		case http.StateNew:
@@ -158,6 +183,7 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		e.serve(w, limit, e.chunk, e.chunkDelay, func(n int64) {
+			e.link(n)
 			if measured {
 				e.pace(n)
 				e.mark(n)
@@ -207,6 +233,7 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if e.upRate > 0 {
 				time.Sleep(time.Duration(float64(n) / e.upRate * float64(time.Second)))
 			}
+			e.link(int64(n))
 			if err != nil {
 				break
 			}
@@ -258,17 +285,24 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // pace holds a write until the shared bottleneck has room for it.
-func (e *service) pace(n int64) {
-	if e.sharedRate == 0 {
+func (e *service) pace(n int64) { e.hold(e.sharedRate, &e.paceNext, n) }
+
+// link holds n bytes on the slow link, if there is one.
+func (e *service) link(n int64) { e.hold(e.linkRate, &e.linkNext, n) }
+
+// hold delays n bytes so the bytes it holds pass at rate bytes per second,
+// shared by every caller that holds on the same next.
+func (e *service) hold(rate float64, next *time.Time, n int64) {
+	if rate == 0 {
 		return
 	}
 	e.mu.Lock()
 	now := time.Now()
-	if e.paceNext.Before(now) {
-		e.paceNext = now
+	if next.Before(now) {
+		*next = now
 	}
-	at := e.paceNext
-	e.paceNext = e.paceNext.Add(time.Duration(float64(n) / e.sharedRate * float64(time.Second)))
+	at := *next
+	*next = next.Add(time.Duration(float64(n) / rate * float64(time.Second)))
 	e.mu.Unlock()
 	time.Sleep(time.Until(at))
 }
@@ -338,7 +372,7 @@ func TestCountsOnlyTestPayloads(t *testing.T) {
 				}
 			})
 			cfg := testConfig(srv.URL)
-			cfg.confirmedOnly = tc.confirmedOnly
+			cfg.test = &testHooks{confirmedOnly: tc.confirmedOnly}
 			res, steps := measure(t, cfg, dir)
 			stop()
 			wg.Wait()
@@ -431,6 +465,22 @@ func TestVerySlowLinksStillMeasure(t *testing.T) {
 	}
 }
 
+func TestASlowSharedLinkStillMeasures(t *testing.T) {
+	t.Parallel()
+	// 0.4 Mbit/s shared by all eight connections, warm-up included: eight
+	// 64 KiB warm-up downloads alone take 10 s, longer than warm-up's budget.
+	// A slow link is a result, not an error.
+	const rate = 50e3
+	_, srv := newService(t, &service{chunk: 4 << 10, linkRate: rate})
+	res, err := run(t.Context(), testConfig(srv.URL), download, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit := rate * 8 / 1e6; res.Mbps > 1.05*limit || res.Mbps < 0.7*limit {
+		t.Errorf("rate %.3f Mbps through a %.1f Mbit/s link", res.Mbps, limit)
+	}
+}
+
 func TestVerySlowUplinksStillMeasure(t *testing.T) {
 	t.Parallel()
 	// 512 kbit/s shared by eight connections: 8 kB/s each, so a 64 KiB
@@ -449,7 +499,7 @@ func TestConfirmedUploadsStopWhenAnswersTurnSlow(t *testing.T) {
 	// rate estimate, which absorbs the late answers, is what stops it.
 	_, srv := newService(t, &service{readDelay: 15 * time.Millisecond, lateAnswer: time.Second, lateAfter: 2500 * time.Millisecond})
 	cfg := testConfig(srv.URL)
-	cfg.confirmedOnly = true
+	cfg.test = &testHooks{confirmedOnly: true}
 	res, _ := measure(t, cfg, upload)
 	if res.Seconds > 5.3 {
 		t.Errorf("measured over %.2f s, want the 5 s window and one confirmation", res.Seconds)
@@ -492,7 +542,7 @@ func TestRejects(t *testing.T) {
 			t.Parallel()
 			_, srv := newService(t, tc.svc)
 			cfg := testConfig(srv.URL)
-			cfg.confirmedOnly = tc.confirmedOnly
+			cfg.test = &testHooks{confirmedOnly: tc.confirmedOnly}
 			_, err := run(t.Context(), cfg, tc.dir, nil)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("err = %v, want it to mention %q", err, tc.want)
@@ -507,7 +557,7 @@ func TestConfirmedCountDropsOnlyAReplacedConnectionsUnconfirmedUpload(t *testing
 	// the one its replacement leaves unconfirmed may go uncounted.
 	e, srv := newService(t, &service{closeOnce: true, readDelay: 15 * time.Millisecond})
 	cfg := testConfig(srv.URL)
-	cfg.confirmedOnly = true
+	cfg.test = &testHooks{confirmedOnly: true}
 	res, _ := measure(t, cfg, upload)
 	e.mu.Lock()
 	served, dropped := e.measured, e.dropped
@@ -526,6 +576,86 @@ func TestRunLeavesNoConnectionsOpen(t *testing.T) {
 		e, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond, readDelay: 15 * time.Millisecond})
 		measure(t, testConfig(srv.URL), dir)
 		waitFor(t, time.Second, "every connection to close", func() bool { return e.open.Load() == 0 })
+	}
+}
+
+// slowHandshakes holds each connection's first write, the server's TLS
+// handshake flight, for delay.
+type slowHandshakes struct {
+	net.Listener
+	delay time.Duration
+}
+
+func (l *slowHandshakes) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &slowHandshakeConn{Conn: c, delay: l.delay}, nil
+}
+
+type slowHandshakeConn struct {
+	net.Conn
+	delay time.Duration
+	once  sync.Once
+}
+
+func (c *slowHandshakeConn) Write(b []byte) (int, error) {
+	c.once.Do(func() { time.Sleep(c.delay) })
+	return c.Conn.Write(b)
+}
+
+func TestSlowHandshakesWithinWarmUpStillConnect(t *testing.T) {
+	t.Parallel()
+	// Every TLS handshake takes 3.5 s, as on a satellite link with a queue:
+	// longer than any few-second cap, within warm-up. Connecting has
+	// warm-up's budget, not a deadline of its own.
+	e := &service{chunk: 64 << 10, chunkDelay: 15 * time.Millisecond}
+	slow := httptest.NewUnstartedServer(e)
+	slow.Listener = &slowHandshakes{Listener: slow.Listener, delay: 3500 * time.Millisecond}
+	slow.StartTLS()
+	t.Cleanup(slow.Close)
+	cfg := testConfig(slow.URL)
+	cfg.tls = slow.Client().Transport.(*http.Transport).TLSClientConfig
+	if _, err := run(t.Context(), cfg, download, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestASlowConnectWithinWarmUpStillConnects(t *testing.T) {
+	t.Parallel()
+	// Every TCP connect takes 3.5 s, as on a lossy link that retransmits
+	// its SYN: within warm-up, so the test runs.
+	_, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond})
+	cfg := testConfig(srv.URL)
+	cfg.test = &testHooks{dialControl: func(string, string, syscall.RawConn) error {
+		time.Sleep(3500 * time.Millisecond)
+		return nil
+	}}
+	if _, err := run(t.Context(), cfg, download, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWarmUpThatRunsOutSaysSo(t *testing.T) {
+	t.Parallel()
+	// The service answers nothing within warm-up.
+	_, srv := newService(t, &service{latency: 2 * time.Second})
+	cfg := testConfig(srv.URL)
+	cfg.warmup = time.Second
+	if _, err := run(t.Context(), cfg, download, nil); !errors.Is(err, errConnectTimeout) {
+		t.Fatalf("got %v, want %v", err, errConnectTimeout)
+	}
+}
+
+func TestACancelledWarmUpIsNotATimeout(t *testing.T) {
+	t.Parallel()
+	_, srv := newService(t, &service{latency: 2 * time.Second})
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	_, err := run(ctx, testConfig(srv.URL), download, nil)
+	if errors.Is(err, errConnectTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want the caller's own deadline", err)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -50,9 +51,19 @@ type config struct {
 	window      time.Duration // measured transfer time
 	drain       time.Duration // extra time for the last uploads to be confirmed
 	proxy       func(*http.Request) (*url.URL, error)
+	test        *testHooks // nil outside tests
+}
+
+// testHooks are knobs only tests turn.
+type testHooks struct {
 	// Count uploads only by confirmed requests, even where the kernel can
-	// say what was acknowledged. Tests use it to exercise that path.
+	// say what was acknowledged, to exercise that path.
 	confirmedOnly bool
+	// Runs on each new socket before it connects, to slow connecting down.
+	dialControl func(network, address string, c syscall.RawConn) error
+	// Told when the measurement window opens, and when its upload count
+	// has been read; returning late holds the count back from run.
+	opened, read func(time.Time)
 }
 
 func defaultConfig() config {
@@ -124,16 +135,10 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		}()
 	}
 
-	warmup := time.NewTimer(time.Until(warmupEnd))
-	defer warmup.Stop()
+	// Every worker reports by warmupEnd: warm-up runs under that deadline.
 	for range cfg.connections {
-		select {
-		case err := <-ready:
-			if err != nil {
-				return result{}, err
-			}
-		case <-warmup.C:
-			return result{}, errors.New("speed test connection timed out")
+		if err := <-ready; err != nil {
+			return result{}, err
 		}
 	}
 
@@ -146,7 +151,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	// Uploads count what the server's TCP acknowledged during the window,
 	// where the kernel says, so a slow last answer cannot stretch the clock.
 	var socket *socketCount
-	if dir == upload && !cfg.confirmedOnly && !viaProxy(cfg) {
+	if dir == upload && (cfg.test == nil || !cfg.test.confirmedOnly) && !viaProxy(cfg) {
 		socket = newSocketCount(workers, strings.HasPrefix(cfg.url, "https://"))
 	}
 	total := func() int64 {
@@ -167,6 +172,9 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 
 	started = time.Now()
 	socket.start()
+	if cfg.test != nil && cfg.test.opened != nil {
+		cfg.test.opened(started)
+	}
 	close(gate)
 
 	windowClose := started.Add(cfg.window)
@@ -174,8 +182,16 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	// The kernel count is read when the window closes, on its own clock.
 	counted := make(chan windowCount, 1)
 	if socket != nil {
+		read := socket.delivered
+		if cfg.test != nil && cfg.test.read != nil {
+			read = func() (int64, bool) {
+				n, ok := socket.delivered()
+				cfg.test.read(time.Now())
+				return n, ok
+			}
+		}
 		windowEnd := time.AfterFunc(cfg.window, func() {
-			counted <- closing.close(socket.delivered)
+			counted <- closing.close(read)
 		})
 		defer windowEnd.Stop()
 	}
@@ -332,6 +348,8 @@ type worker struct {
 // errWindowClosed ends a download whose window closed mid-request.
 var errWindowClosed = errors.New("measurement window closed")
 
+var errConnectTimeout = errors.New("speed test connection timed out")
+
 var errTooSlow = errors.New("the connection is too slow to finish an upload in the test window")
 
 // uploadClose orders worker failures against the reading of the upload
@@ -421,10 +439,12 @@ func (d *downloadWindow) cutAll() {
 func newWorker(cfg config, dir mode) *worker {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
+	// Connecting has no timeout of its own: every request carries the
+	// warm-up's or the window's deadline, and on a slow link eight parallel
+	// handshakes share it.
 	transport := &http.Transport{
 		Proxy:               cfg.proxy,
 		TLSClientConfig:     cfg.tls,
-		TLSHandshakeTimeout: 3 * time.Second,
 		MaxConnsPerHost:     1,
 		MaxIdleConnsPerHost: 1,
 		DisableCompression:  true,
@@ -448,7 +468,10 @@ func newWorker(cfg config, dir mode) *worker {
 	if dir == upload {
 		w.sizes = uploadSizes
 	}
-	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	var dialer net.Dialer
+	if cfg.test != nil {
+		dialer.Control = cfg.test.dialControl
+	}
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		conn, err := dialer.DialContext(ctx, network, address)
 		tcp, ok := conn.(*net.TCPConn)
@@ -461,23 +484,37 @@ func newWorker(cfg config, dir mode) *worker {
 	return w
 }
 
-// warm opens the connection, measures its request latency and grows the
-// payload until one request takes at least 250 ms or reaches 8 MiB.
-func (w *worker) warm(ctx context.Context, deadline time.Time) error {
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+// warm opens the connection and measures its request latency. An upload
+// connection also grows its payload until one request takes at least 250 ms
+// or reaches 8 MiB.
+func (w *worker) warm(ctx context.Context, deadline time.Time) (err error) {
+	warm, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	defer func() {
+		// Warm-up's own deadline, not a cancelled run.
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			err = errConnectTimeout
+		}
+	}()
 
 	// The first probe pays for DNS, TCP and TLS; the second is a request on
 	// the warm connection.
-	if _, err := w.do(ctx, probe, 0, false); err != nil {
+	if _, err := w.do(warm, probe, 0, false); err != nil {
 		return err
 	}
-	latency, err := w.do(ctx, probe, 0, false)
+	latency, err := w.do(warm, probe, 0, false)
 	if err != nil {
 		return err
 	}
+	w.latency = latency
+	// Downloads stream the largest payload until the window closes, so a
+	// warm-up transfer would only take a slow link's time from the probes
+	// of the other connections.
+	if w.dir == download {
+		return nil
+	}
 	size := w.sizes[0]
-	took, err := w.do(ctx, w.dir, size, false)
+	took, err := w.do(warm, w.dir, size, false)
 	if err != nil {
 		return err
 	}
@@ -486,15 +523,13 @@ func (w *worker) warm(ctx context.Context, deadline time.Time) error {
 			break
 		}
 		size = next
-		if took, err = w.do(ctx, w.dir, size, false); err != nil {
+		if took, err = w.do(warm, w.dir, size, false); err != nil {
 			return err
 		}
 	}
-	w.latency, w.warmSize, w.warmTime = latency, size, took
-	if w.dir == upload {
-		// Let the server take in the warm-up uploads before measuring.
-		_, err = w.do(ctx, probe, 0, false)
-	}
+	w.warmSize, w.warmTime = size, took
+	// Let the server take in the warm-up uploads before measuring.
+	_, err = w.do(warm, probe, 0, false)
 	return err
 }
 
