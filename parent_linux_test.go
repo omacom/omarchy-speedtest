@@ -20,13 +20,14 @@ func TestParentDeathStopsTransfers(t *testing.T) {
 	}
 	// A shell stands in for the launcher: it starts the test and waits. The
 	// test writes to /dev/null, so a closed pipe cannot be what stops it.
-	parent := exec.Command("sh", "-c", `"$0" down >/dev/null & echo $!; wait`, exe)
+	parent := exec.CommandContext(t.Context(), "sh", "-c", `"$0" down >/dev/null & echo $!; wait`, exe)
 	parent.Env = append(os.Environ(), asCommand+"=1", "OMARCHY_SPEEDTEST_URL="+srv.URL)
 	stdout, _ := parent.StdoutPipe()
 	if err := parent.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { parent.Process.Kill(); parent.Wait() })
+	// Cleanup after a failure: the parent may already be gone.
+	t.Cleanup(func() { _ = parent.Process.Kill(); _ = parent.Wait() })
 	lines := bufio.NewScanner(stdout)
 	if !lines.Scan() {
 		t.Fatal("no PID from the parent")
@@ -35,15 +36,17 @@ func TestParentDeathStopsTransfers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { syscall.Kill(child, syscall.SIGKILL) })
+	t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
 	waitFor(t, 15*time.Second, "the measurement to start", func() bool {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		return e.measured > 0
 	})
 
-	parent.Process.Kill()
-	parent.Wait()
+	if err := parent.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = parent.Wait() // reports the kill above
 	waitFor(t, 3*time.Second, "the orphaned test to exit", func() bool {
 		stat, err := os.ReadFile("/proc/" + strconv.Itoa(child) + "/stat")
 		return err != nil || strings.Contains(string(stat), ") Z ")

@@ -35,7 +35,7 @@ first: it is the reference for how the measurement works.
 
   ```sh
   go test -race -shuffle=on ./...
-  golangci-lint run
+  golangci-lint run          # on macOS also GOOS=linux: some files are Linux-only
   go tool -modfile=tools/go.mod govulncheck ./...
   go tool -modfile=tools/go.mod actionlint
   ```
