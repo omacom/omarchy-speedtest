@@ -127,6 +127,7 @@ func BenchmarkRoundTrip(b *testing.B) {
 				cfg.tls = srv.Client().Transport.(*http.Transport).TLSClientConfig
 			}
 			w := newWorker(cfg, tc.dir)
+			w.win = newDownloadWindow(time.Hour)
 			defer w.client.CloseIdleConnections()
 			ctx, cancel := context.WithDeadline(b.Context(), time.Now().Add(time.Hour))
 			defer cancel()
