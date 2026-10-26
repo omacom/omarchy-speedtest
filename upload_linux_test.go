@@ -1,14 +1,18 @@
 package main
 
 import (
+	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestALateAnswerDoesNotStretchTheUploadWindow(t *testing.T) {
@@ -140,5 +144,88 @@ func TestUploadsThroughAProxyCountConfirmedRequests(t *testing.T) {
 	e.mu.Unlock()
 	if res.Bytes != served {
 		t.Errorf("counted %d bytes, server read %d in full", res.Bytes, served)
+	}
+}
+
+// bytesReceived is tcpi_bytes_received, at byte 128 of struct tcp_info.
+func bytesReceived(t *testing.T, conn net.Conn) uint64 {
+	t.Helper()
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return 0
+	}
+	raw, err := tcp.SyscallConn()
+	if err != nil {
+		return 0
+	}
+	var n uint64
+	_ = raw.Control(func(fd uintptr) {
+		var info [256]byte
+		size := uint32(len(info))
+		_, _, errno := syscall.Syscall6(syscall.SYS_GETSOCKOPT, fd, syscall.IPPROTO_TCP, syscall.TCP_INFO,
+			uintptr(unsafe.Pointer(&info[0])), uintptr(unsafe.Pointer(&size)), 0)
+		if errno == 0 && size >= 136 {
+			n = binary.NativeEndian.Uint64(info[128:136])
+		}
+	})
+	return n
+}
+
+func TestABlockedProgressCannotAddBytesAfterTheWindow(t *testing.T) {
+	t.Parallel()
+	// The panel stops reading for three seconds just before the window
+	// closes, while uploads are still in flight because the link slowed.
+	// The count is taken when the window closes, not when the main loop
+	// gets round to it: it matches what the server's TCP received in the
+	// window.
+	e, srv := newService(t, &service{readDelay: 15 * time.Millisecond, slowAfter: 4500 * time.Millisecond, slowReadDelay: 400 * time.Millisecond})
+	received := func() (n uint64) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		for _, c := range e.serverConns {
+			n += bytesReceived(t, c)
+		}
+		return n
+	}
+	window := make(chan uint64, 1)
+	go func() {
+		// The server's kernel takes a receive window per connection before
+		// the handler sees the first header, so the window's starting count
+		// is the last one read before any measured byte.
+		var before uint64
+		for {
+			e.mu.Lock()
+			first := e.first
+			e.mu.Unlock()
+			if !first.IsZero() {
+				time.Sleep(time.Until(first.Add(5 * time.Second)))
+				window <- received() - before
+				return
+			}
+			before = received()
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+	// The first update comes 250 ms into the window; block at 4.75 s.
+	var blocked atomic.Bool
+	var first time.Time
+	progress := func(float64) {
+		if first.IsZero() {
+			first = time.Now()
+		}
+		if time.Since(first) >= 4500*time.Millisecond && blocked.CompareAndSwap(false, true) {
+			time.Sleep(3 * time.Second)
+		}
+	}
+	res, err := run(t.Context(), testConfig(srv.URL), upload, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inWindow := float64(<-window)
+	if !blocked.Load() {
+		t.Fatal("progress never blocked")
+	}
+	if float64(res.Bytes) > 1.02*inWindow || float64(res.Bytes) < 0.98*inWindow {
+		t.Errorf("counted %d bytes, the server's TCP received %.0f in the window", res.Bytes, inWindow)
 	}
 }

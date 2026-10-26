@@ -50,9 +50,16 @@ type service struct {
 	// Measured upload bytes as they arrive, before any answer.
 	rxBytes         int64
 	rxFirst, rxLast time.Time
-	uploads         []int64 // measured upload sizes
-	perConn         map[string]int
-	dropped         int64 // the upload whose connection closeOnce closed
+	rxTimes         []time.Time // arrival of each measured upload chunk
+	rxSizes         []int64
+	// Read slower from slowAfter into the measurement on, so uploads are
+	// still in flight when the window closes.
+	slowAfter     time.Duration
+	slowReadDelay time.Duration
+	serverConns   []net.Conn // every connection the service accepted
+	uploads       []int64    // measured upload sizes
+	perConn       map[string]int
+	dropped       int64 // the upload whose connection closeOnce closed
 
 	closed   atomic.Bool
 	paceNext time.Time      // when the shared bottleneck is next free
@@ -69,10 +76,13 @@ func newService(t *testing.T, e *service) (*service, *httptest.Server) {
 		e.chunk = 64 << 10
 	}
 	srv := httptest.NewUnstartedServer(e)
-	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+	srv.Config.ConnState = func(c net.Conn, state http.ConnState) {
 		switch state {
 		case http.StateNew:
 			e.open.Add(1)
+			e.mu.Lock()
+			e.serverConns = append(e.serverConns, c)
+			e.mu.Unlock()
 		case http.StateClosed, http.StateHijacked:
 			e.open.Add(-1)
 		case http.StateActive, http.StateIdle:
@@ -188,6 +198,8 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				e.rxBytes += int64(n)
 				e.rxLast = time.Now()
+				e.rxTimes = append(e.rxTimes, e.rxLast)
+				e.rxSizes = append(e.rxSizes, int64(n))
 				e.mu.Unlock()
 			}
 			if e.upRate > 0 {
@@ -196,7 +208,15 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				break
 			}
-			time.Sleep(e.readDelay)
+			delay := e.readDelay
+			if e.slowAfter > 0 {
+				e.mu.Lock()
+				if !e.first.IsZero() && time.Since(e.first) > e.slowAfter {
+					delay = e.slowReadDelay
+				}
+				e.mu.Unlock()
+			}
+			time.Sleep(delay)
 		}
 		if got != r.ContentLength {
 			return

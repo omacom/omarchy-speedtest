@@ -166,29 +166,42 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	socket.start()
 	close(gate)
 
+	// The kernel count is read when the window closes, on its own clock: a
+	// progress callback that holds up this loop cannot let later
+	// acknowledgements in.
+	windowCount := make(chan result, 1)
+	if socket != nil {
+		windowEnd := time.AfterFunc(cfg.window, func() {
+			if n, ok := socket.delivered(); ok {
+				windowCount <- result{Bytes: n, Seconds: cfg.window.Seconds(), Mbps: mbps(n, cfg.window), Connections: cfg.connections}
+			}
+		})
+		defer windowEnd.Stop()
+	}
+
 	limit := time.NewTimer(cfg.window + cfg.drain + time.Second)
 	defer limit.Stop()
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
-	windowEnd := time.NewTimer(cfg.window)
-	defer windowEnd.Stop()
 	ended := started
 	for finished := 0; finished < cfg.connections; {
 		select {
-		case <-windowEnd.C:
-			if n, ok := socket.delivered(); ok {
-				if tooSlow() {
-					return result{}, errors.New("the connection is too slow to finish an upload in the test window")
-				}
-				return result{
-					Bytes:       n,
-					Seconds:     cfg.window.Seconds(),
-					Mbps:        mbps(n, cfg.window),
-					Connections: cfg.connections,
-				}, nil
+		case res := <-windowCount:
+			if tooSlow() {
+				return result{}, errTooSlow
 			}
+			return res, nil
 		case e := <-done:
 			if e.err != nil {
+				// A transfer cut off after the window closed does not
+				// change what was counted in it.
+				select {
+				case res := <-windowCount:
+					if !tooSlow() {
+						return res, nil
+					}
+				default:
+				}
 				return result{}, e.err
 			}
 			finished++
@@ -208,7 +221,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	// holds, over the time the run took.
 	if n, ok := socket.delivered(); ok {
 		if tooSlow() {
-			return result{}, errors.New("the connection is too slow to finish an upload in the test window")
+			return result{}, errTooSlow
 		}
 		elapsed := ended.Sub(started)
 		return result{Bytes: n, Seconds: elapsed.Seconds(), Mbps: mbps(n, elapsed), Connections: cfg.connections}, nil
@@ -221,7 +234,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 				return result{}, errors.New("the speed test service never confirmed an upload")
 			}
 		}
-		return result{}, errors.New("the connection is too slow to finish an upload in the test window")
+		return result{}, errTooSlow
 	}
 
 	// Downloads count in one window from the first measured byte. Uploads
@@ -276,6 +289,8 @@ type worker struct {
 
 // errWindowClosed ends a download whose window closed mid-request.
 var errWindowClosed = errors.New("measurement window closed")
+
+var errTooSlow = errors.New("the connection is too slow to finish an upload in the test window")
 
 // downloadWindow is the one window every download connection counts in. It
 // opens at the first measured byte on any connection, so the wait for that
