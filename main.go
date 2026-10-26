@@ -55,7 +55,7 @@ var version = "dev"
 
 func cli(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
-		fmt.Fprintln(stdout, "omarchy-speedtest", version)
+		_, _ = fmt.Fprintln(stdout, "omarchy-speedtest", version)
 		return 0
 	}
 	var dir mode
@@ -65,33 +65,33 @@ func cli(args []string, stdout, stderr io.Writer) int {
 	}
 	asJSON := len(args) == 2 && args[1] == "--json"
 	if !ok || len(args) > 2 || len(args) == 2 && !asJSON {
-		fmt.Fprintln(stderr, "Usage: omarchy-speedtest down|up [--json] | --version")
+		_, _ = fmt.Fprintln(stderr, "Usage: omarchy-speedtest down|up [--json] | --version")
 		return 2
 	}
 
 	cfg, err := configFromEnv()
 	if err != nil {
-		fmt.Fprintf(stderr, "Speed test failed: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "Speed test failed: %v\n", err)
 		return 1
 	}
 	var progress func(float64)
 	if !asJSON {
-		progress = func(rate float64) { fmt.Fprintln(stdout, formatMbps(rate)) }
+		progress = func(rate float64) { _, _ = fmt.Fprintln(stdout, formatMbps(rate)) }
 	}
 	res, err := run(context.Background(), cfg, dir, progress)
 	if err != nil {
-		fmt.Fprintf(stderr, "Speed test failed: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "Speed test failed: %v\n", err)
 		return 1
 	}
 	if asJSON {
 		out, err := json.Marshal(res)
 		if err != nil {
-			fmt.Fprintf(stderr, "Speed test failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "Speed test failed: %v\n", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "%s\n", out)
+		_, _ = fmt.Fprintf(stdout, "%s\n", out)
 	} else {
-		fmt.Fprintln(stdout, formatMbps(res.Mbps))
+		_, _ = fmt.Fprintln(stdout, formatMbps(res.Mbps))
 	}
 	return 0
 }

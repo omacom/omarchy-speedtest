@@ -1,37 +1,86 @@
+# golangci-lint v2 configuration.
+#
+# The merge gate is defects, not preferences: the standard set plus the
+# linters that find real bugs (leaked bodies, wrapped-error comparisons,
+# lost nil checks, shadowed builtins, unused parameters), the security
+# analyzer, and the analyzers that keep the code on current Go. Style
+# opinion linters (line length, function length, magic numbers, error
+# wrapping policy) stay off on purpose: a preference that fails CI is a tax
+# on every contributor who does not share it.
+#
+# Intentionally ignored errors are written as an explicit `_ =` in the code,
+# and every //nolint must name its linter and say why.
 version: "2"
 
+run:
+  timeout: 4m
+
+issues:
+  # Report everything: the default caps hide findings behind "N more".
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
 linters:
+  # errcheck, govet, ineffassign, staticcheck, unused
   default: standard
   enable:
+    # Bugs and leaks.
     - bodyclose
+    - durationcheck
+    - errname
     - errorlint
+    - exhaustive
     - gocritic
-    - gosec
-    - misspell
-    - modernize
-    - nolintlint
-    - perfsprint
-    - revive
-    - thelper
+    - nilerr
+    - nilnesserr
+    - noctx
+    - predeclared
+    - reassign
     - unconvert
     - unparam
+    - wastedassign
+    # Security.
+    - gosec
+    # Current Go idioms.
+    - intrange
+    - modernize
+    - perfsprint
     - usestdlibvars
+    # Tests.
+    - thelper
+    - usetesting
+    # Hygiene.
+    - misspell
+    - nolintlint
+    - revive
   settings:
-    errcheck:
-      exclude-functions:
-        # Output to the terminal or the panel: a closed stdout ends the
-        # process with SIGPIPE, and there is nowhere to report to.
-        - fmt.Fprintf
-        - fmt.Fprintln
-        # Response bodies are closed after they have been read in full.
-        - (io.ReadCloser).Close
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # readable field order over memory layout
+        - shadow # too noisy for `err :=` in nested scopes
+    staticcheck:
+      checks: ["all"]
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+    nolintlint:
+      require-explanation: true
+      require-specific: true
   exclusions:
+    generated: strict
+    warn-unused: true
     rules:
-      # The stand-in server writes to clients that may already be gone, and
-      # the process tests run the test binary itself.
-      - path: _test\.go
-        linters: [errcheck, gosec]
+      # The process tests run the test binary itself.
+      - path: _test\.go$
+        linters: [gosec]
 
 formatters:
   enable:
     - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/omacom/omarchy-speedtest

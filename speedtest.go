@@ -348,6 +348,8 @@ func (w *worker) do(ctx context.Context, m mode, size int64, measured bool) (tim
 	method, path := http.MethodGet, "/latency"
 	var body io.Reader
 	switch m {
+	case probe:
+		// GET /latency, as set above.
 	case download:
 		path = "/down?bytes=" + strconv.FormatInt(size, 10)
 	case upload:
@@ -375,7 +377,8 @@ func (w *worker) do(ctx context.Context, m mode, size int64, measured bool) (tim
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	// The body is read in full below, so closing it reports nothing useful.
+	defer func() { _ = resp.Body.Close() }()
 	want := http.StatusOK
 	if m == probe {
 		want = http.StatusNoContent
@@ -390,6 +393,8 @@ func (w *worker) do(ctx context.Context, m mode, size int64, measured bool) (tim
 	}
 	w.pending = 0
 	switch m {
+	case probe:
+		// A 204 has no body to read.
 	case download:
 		err = w.receive(ctx, resp.Body, size, measured)
 	case upload:

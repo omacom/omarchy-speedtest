@@ -58,6 +58,8 @@ func newService(t *testing.T, e *service) (*service, *httptest.Server) {
 			e.open.Add(1)
 		case http.StateClosed, http.StateHijacked:
 			e.open.Add(-1)
+		case http.StateActive, http.StateIdle:
+			// The connection is still open.
 		}
 	}
 	srv.Start()
@@ -127,11 +129,11 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if measured && e.earlyAck {
 			// Acknowledge before reading the body, then read it.
-			http.NewResponseController(w).EnableFullDuplex()
+			_ = http.NewResponseController(w).EnableFullDuplex()
 			w.Header().Set("Connection", "close")
-			w.Write([]byte(`{"acceptedBytes":` + strconv.FormatInt(r.ContentLength, 10) + `}`))
-			http.NewResponseController(w).Flush()
-			io.Copy(io.Discard, r.Body)
+			_, _ = w.Write([]byte(`{"acceptedBytes":` + strconv.FormatInt(r.ContentLength, 10) + `}`))
+			_ = http.NewResponseController(w).Flush()
+			_, _ = io.Copy(io.Discard, r.Body)
 			return
 		}
 		chunk := 64 << 10
@@ -175,7 +177,7 @@ func (e *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if measured && (e.closeAfter || replace) {
 			w.Header().Set("Connection", "close")
 		}
-		w.Write([]byte(`{"acceptedBytes":` + strconv.FormatInt(got, 10) + `}`))
+		_, _ = w.Write([]byte(`{"acceptedBytes":` + strconv.FormatInt(got, 10) + `}`))
 	default:
 		http.NotFound(w, r)
 	}
@@ -237,8 +239,8 @@ func TestCountsOnlyTestPayloads(t *testing.T) {
 					if err != nil {
 						return
 					}
-					io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
 				}
 			})
 			res, steps := measure(t, testConfig(srv.URL), dir)
