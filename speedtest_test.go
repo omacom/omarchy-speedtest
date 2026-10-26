@@ -357,20 +357,23 @@ func TestCountsOnlyTestPayloads(t *testing.T) {
 			t.Parallel()
 			e, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond, readDelay: 15 * time.Millisecond})
 
-			// Unrelated traffic on the same link must not reach the result.
+			// Unrelated traffic on the same link must not reach the result:
+			// four streams of it, half as many as the test's own.
 			ctx, stop := context.WithCancel(t.Context())
 			var wg sync.WaitGroup
-			wg.Go(func() {
-				for ctx.Err() == nil {
-					req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/noise", nil)
-					resp, err := http.DefaultClient.Do(req)
-					if err != nil {
-						return
+			for range 4 {
+				wg.Go(func() {
+					for ctx.Err() == nil {
+						req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/noise", nil)
+						resp, err := http.DefaultClient.Do(req)
+						if err != nil {
+							return
+						}
+						_, _ = io.Copy(io.Discard, resp.Body)
+						_ = resp.Body.Close()
 					}
-					_, _ = io.Copy(io.Discard, resp.Body)
-					_ = resp.Body.Close()
-				}
-			})
+				})
+			}
 			cfg := testConfig(srv.URL)
 			cfg.test = &testHooks{confirmedOnly: tc.confirmedOnly}
 			res, steps := measure(t, cfg, dir)
