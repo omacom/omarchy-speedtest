@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json/v2"
+	"errors"
 	"os"
 	"os/exec"
 	"strconv"
@@ -47,7 +48,7 @@ func TestCommandUsage(t *testing.T) {
 	t.Parallel()
 	for _, args := range [][]string{nil, {"sideways"}, {"down", "--yaml"}, {"down", "--json", "x"}} {
 		out, err := command(t, "http://127.0.0.1:1", args...).CombinedOutput()
-		if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 2 || !strings.Contains(string(out), "Usage:") {
+		if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 2 || !strings.Contains(string(out), "Usage:") {
 			t.Errorf("%q: err = %v, output %q", args, err, out)
 		}
 	}
@@ -59,7 +60,7 @@ func TestCommandRejectsBadEnvironment(t *testing.T) {
 		cmd := command(t, "http://127.0.0.1:1", "down")
 		cmd.Env = append(cmd.Env, env)
 		out, err := cmd.CombinedOutput()
-		if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 || !strings.Contains(string(out), "Speed test failed") {
+		if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 || !strings.Contains(string(out), "Speed test failed") {
 			t.Errorf("%s: err = %v, output %q", env, err, out)
 		}
 	}
@@ -120,7 +121,7 @@ func TestCommandFailsOnServerError(t *testing.T) {
 	t.Parallel()
 	_, srv := newService(t, &service{truncate: true})
 	out, err := command(t, srv.URL, "down").CombinedOutput()
-	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 || !strings.Contains(string(out), "Speed test failed") {
+	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 || !strings.Contains(string(out), "Speed test failed") {
 		t.Errorf("err = %v, output %q", err, out)
 	}
 }
@@ -139,7 +140,9 @@ func TestTerminationClosesEveryConnection(t *testing.T) {
 			if !bufio.NewScanner(stdout).Scan() {
 				t.Fatal("no progress before the signal")
 			}
-			cmd.Process.Signal(sig)
+			if err := cmd.Process.Signal(sig); err != nil {
+				t.Fatal(err)
+			}
 			if err := cmd.Wait(); err == nil {
 				t.Error("a terminated test reported success")
 			}
