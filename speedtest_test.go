@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -594,5 +595,30 @@ func TestBytesAfterTheWindowAreNotCounted(t *testing.T) {
 	err := w.receive(bytes.NewReader(make([]byte, 64<<10)), 64<<10, true)
 	if err == nil || w.bytes.Load() != 0 {
 		t.Errorf("err = %v, counted %d bytes after the window", err, w.bytes.Load())
+	}
+}
+
+func TestAFailureCountsByWhetherTheWindowHadClosed(t *testing.T) {
+	t.Parallel()
+	bad := errors.New("bad acknowledgement")
+	read := func() (int64, bool) { return 100, true }
+
+	// Failed first: the close carries the failure, whatever order the run
+	// loop reads them in.
+	var before uploadClose
+	if late := before.fail(bad); late {
+		t.Error("a failure before the close was called late")
+	}
+	if c := before.close(read); !errors.Is(c.err, bad) {
+		t.Errorf("the close carried %v, want the earlier failure", c.err)
+	}
+
+	// Closed first: the failure is late and the count stands.
+	var after uploadClose
+	if c := after.close(read); c.err != nil || c.bytes != 100 || !c.ok {
+		t.Errorf("the close gave %+v, want the count", c)
+	}
+	if late := after.fail(bad); !late {
+		t.Error("a failure after the close was not called late")
 	}
 }

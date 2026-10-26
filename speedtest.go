@@ -89,9 +89,11 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	defer cancel()
 
 	type end struct {
-		at  time.Time
-		err error
+		at   time.Time
+		err  error
+		late bool // the upload window had closed when it failed
 	}
+	var closing uploadClose
 	workers := make([]*worker, cfg.connections)
 	ready := make(chan error, cfg.connections)
 	done := make(chan end, cfg.connections)
@@ -117,10 +119,8 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 				return
 			}
 			at, err := w.measure(ctx, started, cfg)
-			if err != nil {
-				at = time.Now()
-			}
-			done <- end{at, err}
+			late := err != nil && closing.fail(err)
+			done <- end{at, err, late}
 		}()
 	}
 
@@ -172,19 +172,17 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	windowClose := started.Add(cfg.window)
 
 	// The kernel count is read when the window closes, on its own clock.
-	type count struct {
-		bytes int64
-		ok    bool
-	}
-	windowCount := make(chan count, 1)
+	counted := make(chan windowCount, 1)
 	if socket != nil {
 		windowEnd := time.AfterFunc(cfg.window, func() {
-			n, ok := socket.delivered()
-			windowCount <- count{n, ok}
+			counted <- closing.close(socket.delivered)
 		})
 		defer windowEnd.Stop()
 	}
-	kernel := func(c count) (result, error) {
+	kernel := func(c windowCount) (result, error) {
+		if c.err != nil {
+			return result{}, c.err
+		}
 		if tooSlow() {
 			return result{}, errTooSlow
 		}
@@ -214,19 +212,19 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	ended := started
-	var closed *count
+	var closed *windowCount
 	var cut error // a transfer cut off after the window closed
 	for finished := 0; finished < cfg.connections; {
 		select {
-		case c := <-windowCount:
-			if c.ok {
+		case c := <-counted:
+			if c.ok || c.err != nil {
 				return kernel(c)
 			}
 			closed = &c
 		case e := <-done:
 			finished++
 			if e.err != nil {
-				if socket == nil || e.at.Before(windowClose) {
+				if !e.late {
 					return result{}, e.err
 				}
 				cut = e.err
@@ -251,7 +249,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 			// The window closed before the last worker finished, so its
 			// own count is the result.
 			if closed == nil {
-				c := <-windowCount
+				c := <-counted
 				closed = &c
 			}
 			if closed.ok {
@@ -335,6 +333,41 @@ type worker struct {
 var errWindowClosed = errors.New("measurement window closed")
 
 var errTooSlow = errors.New("the connection is too slow to finish an upload in the test window")
+
+// uploadClose orders worker failures against the reading of the upload
+// window's count, under one lock. A failure recorded before the read fails
+// the run, and the read carries it; one recorded after leaves the count to
+// decide. The order the run loop receives them in does not matter.
+type uploadClose struct {
+	mu     sync.Mutex
+	closed bool
+	err    error // the first failure before the read
+}
+
+type windowCount struct {
+	bytes int64
+	ok    bool
+	err   error
+}
+
+// fail records err and reports whether the window had already closed.
+func (u *uploadClose) fail(err error) (late bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if !u.closed && u.err == nil {
+		u.err = err
+	}
+	return u.closed
+}
+
+// close closes the window and reads its count.
+func (u *uploadClose) close(read func() (int64, bool)) windowCount {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.closed = true
+	n, ok := read()
+	return windowCount{n, ok, u.err}
+}
 
 // downloadWindow is the one window every download connection counts in. It
 // opens at the first measured byte on any connection, so the wait for that
