@@ -40,6 +40,9 @@ type service struct {
 	// One bottleneck for every measured download, in bytes per second, and
 	// a first byte held back a second on every other connection.
 	sharedRate float64
+	// The listener's receive buffer, so the server's kernel acknowledges
+	// uploads only as fast as the handler reads them.
+	rcvBuf int
 	// One slow link under every request, warm-up included: body bytes in
 	// either direction, in bytes per second shared by all connections.
 	linkRate         float64
@@ -83,6 +86,23 @@ func newService(t *testing.T, e *service) (*service, *httptest.Server) {
 		e.chunk = 64 << 10
 	}
 	srv := httptest.NewUnstartedServer(e)
+	if e.rcvBuf > 0 {
+		lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+			var err error
+			if cerr := c.Control(func(fd uintptr) {
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, e.rcvBuf)
+			}); cerr != nil {
+				return cerr
+			}
+			return err
+		}}
+		ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = srv.Listener.Close()
+		srv.Listener = ln
+	}
 	srv.Config.ConnState = func(c net.Conn, state http.ConnState) {
 		switch state {
 		case http.StateNew:
