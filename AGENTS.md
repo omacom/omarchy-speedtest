@@ -43,8 +43,9 @@ first: it is the reference for how the measurement works.
 - Commit subjects are one imperative sentence without a prefix or a
   trailing period; the body says why.
 - Actions are pinned to full commit SHAs. Dependabot updates them and the
-  Go tools after a cooldown. The golangci-lint, GoReleaser, cosign, syft
-  and zizmor versions sit in each workflow's `env:` and are bumped by hand.
+  Go tools after a cooldown, and zizmor with its action. The golangci-lint,
+  GoReleaser, cosign and syft versions sit in each workflow's `env:` and
+  are bumped by hand.
 
 ## Releases
 
