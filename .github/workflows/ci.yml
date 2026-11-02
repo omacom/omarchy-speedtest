@@ -20,7 +20,6 @@ env:
   GOLANGCI_LINT_VERSION: v2.15.0
   GORELEASER_VERSION: v2.19.0
   SYFT_VERSION: v1.55.0
-  ZIZMOR_VERSION: 1.31.1
 
 jobs:
   test:
@@ -126,9 +125,13 @@ jobs:
           check-latest: true
           cache: false
       - run: go tool -modfile=tools/go.mod actionlint
-      - run: pipx run "zizmor==${ZIZMOR_VERSION}" --format=github .github
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # The action installs the zizmor release it pins, from hash-locked
+      # wheels, so Dependabot's bump of the action bumps zizmor too.
+      - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        with:
+          inputs: .github
+          advanced-security: false
+          annotations: true
 
   release-check:
     name: release (dry run)
