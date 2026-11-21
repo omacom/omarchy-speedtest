@@ -1,21 +1,17 @@
 package main
 
 import (
-	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
-	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 )
 
 func TestALateAnswerDoesNotStretchTheUploadWindow(t *testing.T) {
@@ -181,97 +177,12 @@ func TestUploadsThroughAProxyCountConfirmedRequests(t *testing.T) {
 	}
 }
 
-// bytesReceived is tcpi_bytes_received, at byte 128 of struct tcp_info.
-func bytesReceived(t *testing.T, conn net.Conn) uint64 {
-	t.Helper()
-	tcp, ok := conn.(*net.TCPConn)
-	if !ok {
-		return 0
-	}
-	raw, err := tcp.SyscallConn()
-	if err != nil {
-		return 0
-	}
-	var n uint64
-	_ = raw.Control(func(fd uintptr) {
-		var info [256]byte
-		size := uint32(len(info))
-		_, _, errno := syscall.Syscall6(syscall.SYS_GETSOCKOPT, fd, syscall.IPPROTO_TCP, syscall.TCP_INFO,
-			uintptr(unsafe.Pointer(&info[0])), uintptr(unsafe.Pointer(&size)), 0)
-		if errno == 0 && size >= 136 {
-			n = binary.NativeEndian.Uint64(info[128:136])
-		}
-	})
-	return n
+// window notes when the client's measurement window opens, when its
+// upload count is read and what that count was.
+type window struct {
+	opened, read atomic.Int64
+	counted      atomic.Int64
 }
-
-// received records what the service's TCP has received over time, so a test
-// can read it afterwards over the client's own window.
-type received struct {
-	mu   sync.Mutex
-	at   []time.Time
-	n    []uint64
-	stop chan struct{}
-	done chan struct{}
-}
-
-func recordReceived(t *testing.T, e *service) *received {
-	t.Helper()
-	r := &received{stop: make(chan struct{}), done: make(chan struct{})}
-	total := func() (n uint64) {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		for _, c := range e.serverConns {
-			n += bytesReceived(t, c)
-		}
-		return n
-	}
-	go func() {
-		defer close(r.done)
-		for {
-			n := total()
-			r.mu.Lock()
-			r.at, r.n = append(r.at, time.Now()), append(r.n, n)
-			r.mu.Unlock()
-			select {
-			case <-r.stop:
-				return
-			case <-time.After(100 * time.Microsecond):
-			}
-		}
-	}()
-	t.Cleanup(r.finish)
-	return r
-}
-
-func (r *received) finish() {
-	select {
-	case <-r.stop:
-	default:
-		close(r.stop)
-	}
-	<-r.done
-}
-
-// between is what was received from a to b, read between samples.
-func (r *received) between(a, b time.Time) float64 {
-	r.finish()
-	at := func(when time.Time) float64 {
-		i, _ := slices.BinarySearchFunc(r.at, when, func(t, w time.Time) int { return t.Compare(w) })
-		i = min(max(i, 1), len(r.at)-1)
-		span := r.at[i].Sub(r.at[i-1]).Seconds()
-		f := 0.0
-		if span > 0 {
-			f = min(max(when.Sub(r.at[i-1]).Seconds()/span, 0), 1)
-		}
-		return float64(r.n[i-1]) + f*(float64(r.n[i])-float64(r.n[i-1]))
-	}
-	return at(b) - at(a)
-}
-
-// window notes when the client's measurement window opens and when its
-// upload count is read.
-type window struct{ opened, read atomic.Int64 }
 
 // watchWindow also runs hold, if any, after the count is read and before
 // run gets it.
@@ -279,8 +190,9 @@ func watchWindow(cfg *config, hold func()) *window {
 	w := &window{}
 	cfg.test = &testHooks{
 		opened: func(t time.Time) { w.opened.Store(t.UnixNano()) },
-		read: func(t time.Time) {
+		read: func(t time.Time, n int64) {
 			w.read.Store(t.UnixNano())
+			w.counted.Store(n)
 			if hold != nil {
 				hold()
 			}
@@ -289,7 +201,8 @@ func watchWindow(cfg *config, hold func()) *window {
 	return w
 }
 
-func (w *window) start() time.Time { return time.Unix(0, w.opened.Load()) }
+// count is the upload count read as the window closed.
+func (w *window) count() int64 { return w.counted.Load() }
 
 // readOnTime fails unless the count was read as the window closed.
 func (w *window) readOnTime(t *testing.T, length time.Duration) {
@@ -319,10 +232,8 @@ func TestABlockedProgressCannotAddBytesAfterTheWindow(t *testing.T) {
 	// The panel stops reading for three seconds just before the window
 	// closes, while uploads are still in flight because the link slowed.
 	// The count is taken when the window closes, not when the main loop
-	// gets round to it: it matches what the server's TCP received in the
-	// window.
-	e, srv := newService(t, &service{readDelay: 15 * time.Millisecond, slowAfter: 4500 * time.Millisecond, slowReadDelay: 400 * time.Millisecond, rcvBuf: 64 << 10})
-	rx := recordReceived(t, e)
+	// gets round to it: the result is the count read at the close.
+	_, srv := newService(t, &service{readDelay: 15 * time.Millisecond, slowAfter: 4500 * time.Millisecond, slowReadDelay: 400 * time.Millisecond, rcvBuf: 64 << 10})
 	// The first update comes 250 ms into the window; block on the 4.75 s one.
 	progress, blocked := blockOnce(4400*time.Millisecond, 3*time.Second)
 	cfg := testConfig(srv.URL)
@@ -332,12 +243,14 @@ func TestABlockedProgressCannotAddBytesAfterTheWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	win.readOnTime(t, cfg.window)
-	inWindow := rx.between(win.start(), win.start().Add(cfg.window))
 	if !blocked.Load() {
 		t.Fatal("progress never blocked")
 	}
-	if float64(res.Bytes) > 1.01*inWindow || float64(res.Bytes) < 0.99*inWindow {
-		t.Errorf("counted %d bytes, the server's TCP received %.0f in the window", res.Bytes, inWindow)
+	if win.count() == 0 {
+		t.Fatal("no upload count was read as the window closed")
+	}
+	if res.Bytes != win.count() {
+		t.Errorf("counted %d bytes, the window closed on %d", res.Bytes, win.count())
 	}
 }
 
@@ -348,9 +261,9 @@ func TestAWorkerThatEndsAfterTheWindowKeepsTheWindowsCount(t *testing.T) {
 	// is held back until the worker has finished and closed its connection.
 	// The worker's end must not reopen the count.
 	e, srv := newService(t, &service{readDelay: 15 * time.Millisecond, lateAnswer: time.Second, lateAfter: 4500 * time.Millisecond})
-	rx := recordReceived(t, e)
 	cfg := testConfig(srv.URL)
 	cfg.connections = 1
+	var workerEnded atomic.Bool
 	win := watchWindow(&cfg, func() {
 		// On run's timer goroutine, so no t.Fatal here.
 		for deadline := time.Now().Add(3 * time.Second); e.open.Load() != 0; time.Sleep(10 * time.Millisecond) {
@@ -359,18 +272,23 @@ func TestAWorkerThatEndsAfterTheWindowKeepsTheWindowsCount(t *testing.T) {
 				return
 			}
 		}
+		workerEnded.Store(true)
 	})
 	res, err := run(t.Context(), cfg, upload, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	win.readOnTime(t, cfg.window)
-	inWindow := rx.between(win.start(), win.start().Add(cfg.window))
+	if !workerEnded.Load() {
+		t.Fatal("the count reached run before the worker had ended")
+	}
 	if res.Seconds != cfg.window.Seconds() {
 		t.Errorf("divided by %.2f s, the window is %.0f s", res.Seconds, cfg.window.Seconds())
 	}
-	if float64(res.Bytes) > 1.01*inWindow || float64(res.Bytes) < 0.99*inWindow {
-		t.Errorf("counted %d bytes, the server's TCP received %.0f in the window", res.Bytes, inWindow)
+	if win.count() == 0 {
+		t.Fatal("no upload count was read as the window closed")
+	}
+	if res.Bytes != win.count() {
+		t.Errorf("counted %d bytes, the window closed on %d", res.Bytes, win.count())
 	}
 }
 

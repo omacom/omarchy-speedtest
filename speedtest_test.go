@@ -65,8 +65,7 @@ type service struct {
 	// still in flight when the window closes.
 	slowAfter     time.Duration
 	slowReadDelay time.Duration
-	serverConns   []net.Conn // every connection the service accepted
-	uploads       []int64    // measured upload sizes
+	uploads       []int64 // measured upload sizes
 	perConn       map[string]int
 	dropped       int64 // the upload whose connection closeOnce closed
 
@@ -103,13 +102,10 @@ func newService(t *testing.T, e *service) (*service, *httptest.Server) {
 		_ = srv.Listener.Close()
 		srv.Listener = ln
 	}
-	srv.Config.ConnState = func(c net.Conn, state http.ConnState) {
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
 		switch state {
 		case http.StateNew:
 			e.open.Add(1)
-			e.mu.Lock()
-			e.serverConns = append(e.serverConns, c)
-			e.mu.Unlock()
 		case http.StateClosed, http.StateHijacked:
 			e.open.Add(-1)
 		case http.StateActive, http.StateIdle:

@@ -62,8 +62,10 @@ type testHooks struct {
 	// Runs on each new socket before it connects, to slow connecting down.
 	dialControl func(network, address string, c syscall.RawConn) error
 	// Told when the measurement window opens, and when its upload count
-	// has been read; returning late holds the count back from run.
-	opened, read func(time.Time)
+	// has been read, with the count read; returning late holds the count
+	// back from run.
+	opened func(time.Time)
+	read   func(time.Time, int64)
 }
 
 func defaultConfig() config {
@@ -208,7 +210,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		if cfg.test != nil && cfg.test.read != nil {
 			read = func() (int64, bool) {
 				n, ok := socket.delivered()
-				cfg.test.read(time.Now())
+				cfg.test.read(time.Now(), n)
 				return n, ok
 			}
 		}
