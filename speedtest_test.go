@@ -727,6 +727,25 @@ func TestAConnectedWorkerThatRunsOutOfWarmUpStillEndsTheRun(t *testing.T) {
 	}
 }
 
+func TestARefusedConnectionStillEndsTheRun(t *testing.T) {
+	t.Parallel()
+	// Only a connection that never opened because warm-up ran out is left
+	// out. A refusal never opened either, but it is a different failure and
+	// still ends the run.
+	_, srv := newService(t, &service{})
+	cfg := testConfig(srv.URL)
+	var dials atomic.Int64
+	cfg.test = &testHooks{dialControl: func(string, string, syscall.RawConn) error {
+		if dials.Add(1) == 1 {
+			return syscall.ECONNREFUSED
+		}
+		return nil
+	}}
+	if _, err := run(t.Context(), cfg, download, nil); !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("got %v, want %v", err, syscall.ECONNREFUSED)
+	}
+}
+
 func TestWarmUpThatRunsOutSaysSo(t *testing.T) {
 	t.Parallel()
 	// The service answers nothing within warm-up.

@@ -123,6 +123,37 @@ func TestAConnectionReplacedBeforeItClosesStillCounts(t *testing.T) {
 	}
 }
 
+func TestAConnectionThatNeverConnectsDoesNotTurnOffTheKernelCount(t *testing.T) {
+	t.Parallel()
+	// The left-out worker must not reach the kernel's upload count: it has
+	// no connection, which turns that count off for every worker, and the
+	// result would fall back to confirmed requests. The kernel counts the
+	// request lines on top of the payload, so its count is higher than the
+	// payload the server read; the confirmed count is exactly that payload.
+	e, srv := newService(t, &service{readDelay: 15 * time.Millisecond})
+	cfg := testConfig(srv.URL)
+	var dials atomic.Int64
+	cfg.test = &testHooks{dialControl: func(string, string, syscall.RawConn) error {
+		if dials.Add(1) == 1 {
+			time.Sleep(cfg.warmup + time.Second)
+		}
+		return nil
+	}}
+	res, _ := measure(t, cfg, upload)
+	if res.Connections != cfg.connections-1 {
+		t.Errorf("measured on %d connections, want %d", res.Connections, cfg.connections-1)
+	}
+	e.mu.Lock()
+	served := e.measured
+	e.mu.Unlock()
+	if served == 0 {
+		t.Fatal("the server saw no measured payload")
+	}
+	if res.Bytes <= served {
+		t.Errorf("counted %d bytes, want more than the %d payload bytes the server read", res.Bytes, served)
+	}
+}
+
 func TestUploadsThroughAProxyCountConfirmedRequests(t *testing.T) {
 	t.Parallel()
 	// Through a proxy the kernel would count what the proxy acknowledged,
