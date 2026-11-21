@@ -65,8 +65,7 @@ type service struct {
 	// still in flight when the window closes.
 	slowAfter     time.Duration
 	slowReadDelay time.Duration
-	serverConns   []net.Conn // every connection the service accepted
-	uploads       []int64    // measured upload sizes
+	uploads       []int64 // measured upload sizes
 	perConn       map[string]int
 	dropped       int64 // the upload whose connection closeOnce closed
 
@@ -103,13 +102,10 @@ func newService(t *testing.T, e *service) (*service, *httptest.Server) {
 		_ = srv.Listener.Close()
 		srv.Listener = ln
 	}
-	srv.Config.ConnState = func(c net.Conn, state http.ConnState) {
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
 		switch state {
 		case http.StateNew:
 			e.open.Add(1)
-			e.mu.Lock()
-			e.serverConns = append(e.serverConns, c)
-			e.mu.Unlock()
 		case http.StateClosed, http.StateHijacked:
 			e.open.Add(-1)
 		case http.StateActive, http.StateIdle:
@@ -586,13 +582,18 @@ func TestRunLeavesNoConnectionsOpen(t *testing.T) {
 // handshake flight, for delay.
 type slowHandshakes struct {
 	net.Listener
-	delay time.Duration
+	delay     time.Duration
+	onlyFirst bool // slow only the first connection accepted
+	accepted  atomic.Int64
 }
 
 func (l *slowHandshakes) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
+	}
+	if l.accepted.Add(1) > 1 && l.onlyFirst {
+		return c, nil
 	}
 	return &slowHandshakeConn{Conn: c, delay: l.delay}, nil
 }
@@ -637,6 +638,107 @@ func TestASlowConnectWithinWarmUpStillConnects(t *testing.T) {
 	}}
 	if _, err := run(t.Context(), cfg, download, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAConnectionThatNeverConnectsLeavesTheRestToMeasure(t *testing.T) {
+	t.Parallel()
+	// One SYN and its retransmits are lost, as on a network that drops some
+	// new connections: that connect outlasts warm-up while the other seven
+	// are ready. The run measures on the seven, and counts only what the
+	// server saw on them.
+	for _, tc := range []struct {
+		name          string
+		dir           mode
+		confirmedOnly bool
+	}{
+		{"download", download, false},
+		{"upload", upload, false},
+		{"upload confirmed", upload, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond, readDelay: 15 * time.Millisecond})
+			cfg := testConfig(srv.URL)
+			var dials atomic.Int64
+			cfg.test = &testHooks{
+				confirmedOnly: tc.confirmedOnly,
+				dialControl: func(string, string, syscall.RawConn) error {
+					if dials.Add(1) == 1 {
+						time.Sleep(cfg.warmup + time.Second)
+					}
+					return nil
+				},
+			}
+			res, _ := measure(t, cfg, tc.dir)
+			if res.Connections != cfg.connections-1 {
+				t.Errorf("measured on %d connections, want %d", res.Connections, cfg.connections-1)
+			}
+			e.mu.Lock()
+			served := e.measured
+			e.mu.Unlock()
+			if served == 0 {
+				t.Fatal("the server saw no measured payload")
+			}
+			switch {
+			case tc.confirmedOnly && res.Bytes != served:
+				t.Errorf("counted %d upload bytes, server acknowledged %d", res.Bytes, served)
+			case tc.dir == upload && res.Bytes < served:
+				t.Errorf("counted %d upload bytes, server read %d in full", res.Bytes, served)
+			case tc.dir == download && res.Bytes > served:
+				t.Errorf("counted %d download bytes, server sent only %d", res.Bytes, served)
+			}
+		})
+	}
+}
+
+func TestNoConnectionThatEverConnectsSaysSo(t *testing.T) {
+	t.Parallel()
+	_, srv := newService(t, &service{})
+	cfg := testConfig(srv.URL)
+	cfg.warmup = time.Second
+	cfg.test = &testHooks{dialControl: func(string, string, syscall.RawConn) error {
+		time.Sleep(cfg.warmup + time.Second)
+		return nil
+	}}
+	if _, err := run(t.Context(), cfg, download, nil); !errors.Is(err, errConnectTimeout) {
+		t.Fatalf("got %v, want %v", err, errConnectTimeout)
+	}
+}
+
+func TestAConnectedWorkerThatRunsOutOfWarmUpStillEndsTheRun(t *testing.T) {
+	t.Parallel()
+	// Only a connection that never opened is left out. One that opened but
+	// is still not ready when warm-up ends fails the run as before.
+	e := &service{chunk: 64 << 10, chunkDelay: 15 * time.Millisecond}
+	slow := httptest.NewUnstartedServer(e)
+	slow.Listener = &slowHandshakes{Listener: slow.Listener, delay: 2 * time.Second, onlyFirst: true}
+	slow.StartTLS()
+	t.Cleanup(slow.Close)
+	cfg := testConfig(slow.URL)
+	cfg.tls = slow.Client().Transport.(*http.Transport).TLSClientConfig
+	cfg.warmup = time.Second
+	if _, err := run(t.Context(), cfg, download, nil); !errors.Is(err, errConnectTimeout) {
+		t.Fatalf("got %v, want %v", err, errConnectTimeout)
+	}
+}
+
+func TestARefusedConnectionStillEndsTheRun(t *testing.T) {
+	t.Parallel()
+	// Only a connection that never opened because warm-up ran out is left
+	// out. A refusal never opened either, but it is a different failure and
+	// still ends the run.
+	_, srv := newService(t, &service{})
+	cfg := testConfig(srv.URL)
+	var dials atomic.Int64
+	cfg.test = &testHooks{dialControl: func(string, string, syscall.RawConn) error {
+		if dials.Add(1) == 1 {
+			return syscall.ECONNREFUSED
+		}
+		return nil
+	}}
+	if _, err := run(t.Context(), cfg, download, nil); !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("got %v, want %v", err, syscall.ECONNREFUSED)
 	}
 }
 

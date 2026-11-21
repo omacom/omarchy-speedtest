@@ -25,11 +25,13 @@ It exits 0 with a result, 1 when the test fails and 2 for a usage error.
   window between the payload and the link.
 - Connecting (DNS, TCP, TLS) and warm-up stay outside the measurement. Each
   connection measures its request latency within warm-up's six seconds, with
-  no shorter timeout of its own, so slow handshakes still connect. Upload
-  connections also grow their payload until a request takes 250 ms, then the
-  five-second window starts. Download connections skip that: they stream
-  the largest payload until the window closes, and warm-up transfers would
-  only take a slow link's time.
+  no shorter timeout of its own, so slow handshakes still connect. A
+  connection that has not even opened by then, as when a lossy network keeps
+  dropping its SYN, is left out and the others measure; `--json` reports how
+  many connections measured. Upload connections also grow their payload until
+  a request takes 250 ms, then the five-second window starts. Download
+  connections skip that: they stream the largest payload until the window
+  closes, and warm-up transfers would only take a slow link's time.
 - Only payload counts, never other traffic on the machine.
 - Downloads count body bytes as they arrive, in one window that opens at
   the first measured byte on any connection, so the wait for that byte does
