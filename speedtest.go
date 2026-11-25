@@ -62,8 +62,10 @@ type testHooks struct {
 	// Runs on each new socket before it connects, to slow connecting down.
 	dialControl func(network, address string, c syscall.RawConn) error
 	// Told when the measurement window opens, and when its upload count
-	// has been read; returning late holds the count back from run.
-	opened, read func(time.Time)
+	// has been read, with the count read; returning late holds the count
+	// back from run.
+	opened func(time.Time)
+	read   func(time.Time, int64)
 }
 
 func defaultConfig() config {
@@ -105,8 +107,12 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		late bool // the upload window had closed when it failed
 	}
 	var closing uploadClose
+	type warmed struct {
+		w   *worker
+		err error
+	}
 	workers := make([]*worker, cfg.connections)
-	ready := make(chan error, cfg.connections)
+	ready := make(chan warmed, cfg.connections)
 	done := make(chan end, cfg.connections)
 	gate := make(chan struct{})
 	var started time.Time
@@ -120,10 +126,10 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		go func() {
 			defer w.client.CloseIdleConnections()
 			if err := w.warm(ctx, warmupEnd); err != nil {
-				ready <- err
+				ready <- warmed{w, err}
 				return
 			}
-			ready <- nil
+			ready <- warmed{w, nil}
 			select {
 			case <-gate:
 			case <-ctx.Done():
@@ -136,11 +142,29 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	}
 
 	// Every worker reports by warmupEnd: warm-up runs under that deadline.
+	// A worker whose TCP connection never opened by then, such as one whose
+	// SYN a lossy network keeps dropping, is left out and the rest measure.
+	// Any other failure ends the run, a connected worker that ran out of
+	// warm-up included, and so does no worker being ready.
+	active := make([]*worker, 0, cfg.connections)
+	var stalled error
 	for range cfg.connections {
-		if err := <-ready; err != nil {
-			return result{}, err
+		r := <-ready
+		switch {
+		case r.err == nil:
+			active = append(active, r.w)
+		case errors.Is(r.err, errConnectTimeout) && !r.w.dialed.Load():
+			stalled = r.err
+		default:
+			return result{}, r.err
 		}
 	}
+	if len(active) == 0 {
+		return result{}, stalled
+	}
+	// From here on only the connections that are measuring count.
+	workers = active
+	connections := len(workers)
 
 	confirmed := func() (n int64) {
 		for _, w := range workers {
@@ -186,7 +210,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		if cfg.test != nil && cfg.test.read != nil {
 			read = func() (int64, bool) {
 				n, ok := socket.delivered()
-				cfg.test.read(time.Now())
+				cfg.test.read(time.Now(), n)
 				return n, ok
 			}
 		}
@@ -202,7 +226,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		if tooSlow() {
 			return result{}, errTooSlow
 		}
-		return result{Bytes: c.bytes, Seconds: cfg.window.Seconds(), Mbps: mbps(c.bytes, cfg.window), Connections: cfg.connections}, nil
+		return result{Bytes: c.bytes, Seconds: cfg.window.Seconds(), Mbps: mbps(c.bytes, cfg.window), Connections: connections}, nil
 	}
 
 	// The progress callback runs on its own goroutine with the latest rate,
@@ -230,7 +254,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	ended := started
 	var closed *windowCount
 	var cut error // a transfer cut off after the window closed
-	for finished := 0; finished < cfg.connections; {
+	for finished := 0; finished < connections; {
 		select {
 		case c := <-counted:
 			if c.ok || c.err != nil {
@@ -281,7 +305,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 				return result{}, errTooSlow
 			}
 			elapsed := ended.Sub(started)
-			return result{Bytes: n, Seconds: elapsed.Seconds(), Mbps: mbps(n, elapsed), Connections: cfg.connections}, nil
+			return result{Bytes: n, Seconds: elapsed.Seconds(), Mbps: mbps(n, elapsed), Connections: connections}, nil
 		}
 	}
 
@@ -305,7 +329,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 		Bytes:       bytes,
 		Seconds:     elapsed.Seconds(),
 		Mbps:        mbps(bytes, elapsed),
-		Connections: cfg.connections,
+		Connections: connections,
 	}, nil
 }
 
@@ -319,6 +343,7 @@ type worker struct {
 	sizes  []int64
 	bytes  atomic.Int64 // measured payload bytes
 	reused atomic.Bool  // whether the last request reused the connection
+	dialed atomic.Bool  // whether a TCP connection ever opened
 	trace  httptrace.ClientTrace
 	buf    []byte
 
@@ -743,6 +768,7 @@ type countedConn struct {
 // track adds tcp to the worker's counted connections.
 func (w *worker) track(tcp *net.TCPConn) *countedConn {
 	counted := &countedConn{TCPConn: tcp, w: w}
+	w.dialed.Store(true)
 	w.socketMu.Lock()
 	w.conns = append(w.conns, counted)
 	w.socketMu.Unlock()
