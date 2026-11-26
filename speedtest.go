@@ -118,6 +118,7 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 	var started time.Time
 
 	win := newDownloadWindow(cfg.window)
+	defer win.stop()
 	warmupEnd := time.Now().Add(cfg.warmup)
 	for i := range workers {
 		w := newWorker(cfg, dir)
@@ -274,11 +275,18 @@ func run(ctx context.Context, cfg config, dir mode, progress func(float64)) (res
 				ended = e.at
 			}
 		case <-tick.C:
+			rate := mbps(total(), time.Since(started))
+			if dir == download {
+				var ok bool
+				if rate, ok = win.rate(total(), time.Now()); !ok {
+					continue
+				}
+			}
 			select {
 			case <-rates:
 			default:
 			}
-			rates <- mbps(total(), time.Since(started))
+			rates <- rate
 		case <-limit.C:
 			return result{}, errors.New("speed test timed out")
 		}
@@ -417,10 +425,13 @@ func (u *uploadClose) close(read func() (int64, bool)) windowCount {
 // byte is not counted against the link, and like any single window it holds
 // no more than the link carried in it, however late a connection starts.
 type downloadWindow struct {
-	length time.Duration
-	mu     sync.Mutex
-	end    time.Time            // zero until the first measured byte
-	cuts   []context.CancelFunc // the requests to cut when it closes
+	length  time.Duration
+	mu      sync.Mutex
+	start   time.Time            // zero until the first measured byte
+	end     time.Time            // zero until the first measured byte
+	timer   *time.Timer          // cuts in-flight requests when end arrives
+	stopped bool                 // run ended before the window closed
+	cuts    []context.CancelFunc // the requests to cut when it closes
 }
 
 func newDownloadWindow(length time.Duration) *downloadWindow {
@@ -439,10 +450,29 @@ func (d *downloadWindow) closesAt(now time.Time) time.Time {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.end.IsZero() {
+		d.start = now
 		d.end = now.Add(d.length)
-		time.AfterFunc(d.length, d.cutAll)
+		if !d.stopped {
+			d.timer = time.AfterFunc(d.length, d.cutAll)
+		}
 	}
 	return d.end
+}
+
+// rate returns the running download rate once the window has been open
+// long enough for a single read not to skew it.
+func (d *downloadWindow) rate(bytes int64, now time.Time) (float64, bool) {
+	d.mu.Lock()
+	start := d.start
+	d.mu.Unlock()
+	if start.IsZero() {
+		return 0, false
+	}
+	elapsed := min(now.Sub(start), d.length)
+	if elapsed < 100*time.Millisecond {
+		return 0, false
+	}
+	return mbps(bytes, elapsed), true
 }
 
 // open reports whether the window has not closed yet.
@@ -450,6 +480,16 @@ func (d *downloadWindow) open() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.end.IsZero() || time.Now().Before(d.end)
+}
+
+// stop cancels the scheduled cut when a run ends before the window closes.
+func (d *downloadWindow) stop() {
+	d.mu.Lock()
+	d.stopped = true
+	if d.timer != nil {
+		d.timer.Stop()
+	}
+	d.mu.Unlock()
 }
 
 func (d *downloadWindow) cutAll() {
@@ -694,11 +734,16 @@ func (w *worker) do(ctx context.Context, m mode, size int64, measured bool) (tim
 // shared window, and bytes that arrive after it closes are never counted.
 func (w *worker) receive(body io.Reader, size int64, measured bool) error {
 	var got int64
+	var end time.Time
 	for {
 		n, err := body.Read(w.buf)
 		if n > 0 {
 			if measured {
-				if now := time.Now(); !now.Before(w.win.closesAt(now)) {
+				now := time.Now()
+				if end.IsZero() {
+					end = w.win.closesAt(now)
+				}
+				if !now.Before(end) {
 					return errWindowClosed
 				}
 				w.bytes.Add(int64(n))

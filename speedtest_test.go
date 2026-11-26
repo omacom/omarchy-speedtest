@@ -833,6 +833,67 @@ func TestBytesAfterTheWindowAreNotCounted(t *testing.T) {
 	}
 }
 
+func TestDownloadProgressTracksTheWindowNotTheFirstByteWait(t *testing.T) {
+	t.Parallel()
+	// With a one-second wait before the first byte, progress updates must
+	// reflect the link's rate once the window opens rather than dividing
+	// by the time since the request was sent.
+	e, srv := newService(t, &service{chunkDelay: 15 * time.Millisecond, firstByteDelay: time.Second})
+	_, steps := measure(t, testConfig(srv.URL), download)
+	e.mu.Lock()
+	want := mbps(e.measured, e.last.Sub(e.firstWrite))
+	e.mu.Unlock()
+	if len(steps) < 5 {
+		t.Fatalf("got %d progress updates, want several", len(steps))
+	}
+	if steps[0] == 0 {
+		t.Errorf("reported 0 Mbps before the download window opened: %v", steps)
+	}
+	last := steps[len(steps)-1]
+	if last < 0.90*want || last > 1.10*want {
+		t.Errorf("last progress update %.1f Mbps, server sent %.1f Mbps once it started", last, want)
+	}
+}
+
+func TestDownloadWindowRateAndStop(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	win := newDownloadWindow(5 * time.Second)
+	if _, ok := win.rate(1<<20, now); ok {
+		t.Error("reported a rate before the window opened")
+	}
+	win.closesAt(now)
+	defer win.stop()
+	if _, ok := win.rate(16<<10, now.Add(5*time.Millisecond)); ok {
+		t.Error("reported a rate on a tiny elapsed window")
+	}
+	if got, ok := win.rate(1250000, now.Add(time.Second)); !ok || got != 10 {
+		t.Errorf("rate at 1s = %g, %v; want 10, true", got, ok)
+	}
+	if got, ok := win.rate(6250000, now.Add(6*time.Second)); !ok || got != 10 {
+		t.Errorf("rate past window close = %g, %v; want 10 (clamped to 5s), true", got, ok)
+	}
+
+	var called atomic.Bool
+	short := newDownloadWindow(40 * time.Millisecond)
+	short.register(func() { called.Store(true) })
+	short.closesAt(time.Now())
+	short.stop()
+	time.Sleep(80 * time.Millisecond)
+	if called.Load() {
+		t.Error("stop did not cancel the window cut timer")
+	}
+
+	stoppedFirst := newDownloadWindow(40 * time.Millisecond)
+	stoppedFirst.register(func() { called.Store(true) })
+	stoppedFirst.stop()
+	stoppedFirst.closesAt(time.Now())
+	time.Sleep(80 * time.Millisecond)
+	if called.Load() {
+		t.Error("closesAt armed a cut timer after stop")
+	}
+}
+
 func TestAFailureCountsByWhetherTheWindowHadClosed(t *testing.T) {
 	t.Parallel()
 	bad := errors.New("bad acknowledgement")

@@ -34,6 +34,7 @@ func BenchmarkReceive(b *testing.B) {
 		b.Run("record="+strconv.FormatInt(record>>10, 10)+"KiB", func(b *testing.B) {
 			w := newWorker(testConfig("http://127.0.0.1:1"), download)
 			w.win = newDownloadWindow(time.Hour)
+			defer w.win.stop()
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
@@ -43,6 +44,22 @@ func BenchmarkReceive(b *testing.B) {
 			}
 		})
 	}
+	b.Run("parallel/record=16KiB", func(b *testing.B) {
+		win := newDownloadWindow(time.Hour)
+		defer win.stop()
+		b.SetBytes(size)
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			w := newWorker(testConfig("http://127.0.0.1:1"), download)
+			w.win = win
+			for pb.Next() {
+				if err := w.receive(&chunkReader{left: size, n: 16 << 10}, size, true); err != nil {
+					b.Error(err)
+					return
+				}
+			}
+		})
+	})
 }
 
 // BenchmarkZeros is the cost of producing an upload body.
